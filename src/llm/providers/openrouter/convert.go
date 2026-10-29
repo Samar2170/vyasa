@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"vyasa/src/internal/llm"
+	"vyasa/src/llm"
 )
 
 type Response struct {

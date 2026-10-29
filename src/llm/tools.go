@@ -2,7 +2,7 @@ package llm
 
 import (
 	"encoding/json"
-	"vyasa/src/internal/types"
+	"vyasa/src/types"
 )
 
 type parameterizedTool interface {

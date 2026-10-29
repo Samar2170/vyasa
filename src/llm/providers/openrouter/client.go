@@ -8,7 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"vyasa/src/internal/llm"
+	"vyasa/src/llm"
 )
 
 const (

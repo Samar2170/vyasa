@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"vyasa/src/internal/llm"
+	"vyasa/src/llm"
 )
 
 func TestToChatRequestTextAndImage(t *testing.T) {
