@@ -159,4 +159,62 @@ func TestFromWireStreamChoice(t *testing.T) {
 	if got.FinishReason != llm.FinishToolCalls {
 		t.Fatalf("finish = %q", got.FinishReason)
 	}
+	if got.Delta.Reasoning != "think" {
+		t.Fatalf("reasoning = %q", got.Delta.Reasoning)
+	}
+	if len(got.Delta.ReasoningDetails) != 1 ||
+		got.Delta.ReasoningDetails[0].Text != "step" {
+		t.Fatalf("reasoning details = %#v", got.Delta.ReasoningDetails)
+	}
+}
+
+func TestToChatRequestReasoning(t *testing.T) {
+	req := llm.Request{
+		Model: "test/model",
+		Messages: []llm.Message{{
+			Role:      llm.RoleAssistant,
+			Reasoning: "thinking",
+			ReasoningDetails: []llm.ReasoningDetail{{
+				Type:   "reasoning.text",
+				Text:   "step",
+				Format: "unknown",
+				Index:  1,
+			}},
+		}},
+	}
+
+	got, err := toChatRequest(req, "")
+	if err != nil {
+		t.Fatalf("toChatRequest: %v", err)
+	}
+	if got.Messages[0].Reasoning != "thinking" {
+		t.Fatalf("reasoning = %q", got.Messages[0].Reasoning)
+	}
+	if len(got.Messages[0].ReasoningDetails) != 1 {
+		t.Fatalf("reasoning details = %#v", got.Messages[0].ReasoningDetails)
+	}
+	if got.Messages[0].ReasoningDetails[0].Text != "step" {
+		t.Fatalf("reasoning text = %q", got.Messages[0].ReasoningDetails[0].Text)
+	}
+}
+
+func TestFromChatResponseReasoning(t *testing.T) {
+	raw := []byte(`{"id":"gen-1","model":"m","choices":[{"message":{"role":"assistant","content":"hi","reasoning":"think","reasoning_details":[{"type":"reasoning.text","text":"step","format":"unknown","index":0}]},"finish_reason":"stop"}]}`)
+
+	var wire chatResponse
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	got, err := fromChatResponse(wire)
+	if err != nil {
+		t.Fatalf("fromChatResponse: %v", err)
+	}
+	if got.Message.Reasoning != "think" {
+		t.Fatalf("reasoning = %q", got.Message.Reasoning)
+	}
+	if len(got.Message.ReasoningDetails) != 1 ||
+		got.Message.ReasoningDetails[0].Text != "step" {
+		t.Fatalf("reasoning details = %#v", got.Message.ReasoningDetails)
+	}
 }

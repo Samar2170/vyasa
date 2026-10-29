@@ -5,16 +5,18 @@ import (
 	"fmt"
 	"os"
 	"vyasa/src/llm"
-	"vyasa/src/llm/providers/openrouter"
+
+	_ "vyasa/src/llm/providers/openrouter"
 
 	"github.com/joho/godotenv"
 )
 
 func loadEnv() {
-	godotenv.Load()
+	godotenv.Load(".env")
 }
 
 func main() {
+	loadEnv()
 	orConfig := llm.Config{
 		APIKey:       os.Getenv("OPENROUTER_API_KEY"),
 		DefaultModel: "z-ai/glm-5.3-flash",
@@ -22,7 +24,6 @@ func main() {
 	if orConfig.APIKey == "" {
 		panic("OPENROUTER_API_KEY not set")
 	}
-	llm.RegisterProvider("openrouter", openrouter.New)
 	client, err := llm.NewClient("openrouter", orConfig)
 	if err != nil {
 		panic(err)

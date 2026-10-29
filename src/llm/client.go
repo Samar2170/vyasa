@@ -30,17 +30,28 @@ type Stream interface {
 }
 
 type Accumulator struct {
-	id        string
-	model     string
-	text      strings.Builder
-	toolCalls map[int]*ToolCall
-	toolOrder []int
-	finish    FinishReason
-	usage     *Usage
+	id               string
+	model            string
+	text             strings.Builder
+	reasoning        strings.Builder
+	reasoningDetails map[reasoningDetailKey]*ReasoningDetail
+	reasoningOrder   []reasoningDetailKey
+	toolCalls        map[int]*ToolCall
+	toolOrder        []int
+	finish           FinishReason
+	usage            *Usage
+}
+
+type reasoningDetailKey struct {
+	Type  string
+	Index int
 }
 
 func NewAccumulator() *Accumulator {
-	return &Accumulator{toolCalls: make(map[int]*ToolCall)}
+	return &Accumulator{
+		toolCalls:        make(map[int]*ToolCall),
+		reasoningDetails: make(map[reasoningDetailKey]*ReasoningDetail),
+	}
 }
 
 func (a *Accumulator) Add(c *Chunk) {
@@ -49,6 +60,9 @@ func (a *Accumulator) Add(c *Chunk) {
 	}
 	if a.toolCalls == nil {
 		a.toolCalls = make(map[int]*ToolCall)
+	}
+	if a.reasoningDetails == nil {
+		a.reasoningDetails = make(map[reasoningDetailKey]*ReasoningDetail)
 	}
 	if a.id == "" {
 		a.id = c.ID
@@ -59,6 +73,22 @@ func (a *Accumulator) Add(c *Chunk) {
 	for _, p := range c.Delta.Parts {
 		if p.Kind == PartText {
 			a.text.WriteString(p.Text)
+		}
+	}
+	a.reasoning.WriteString(c.Delta.Reasoning)
+	for _, rd := range c.Delta.ReasoningDetails {
+		key := reasoningDetailKey{Type: rd.Type, Index: rd.Index}
+		cur, ok := a.reasoningDetails[key]
+		if !ok {
+			cur = &ReasoningDetail{Type: rd.Type, Index: rd.Index}
+			a.reasoningDetails[key] = cur
+			a.reasoningOrder = append(a.reasoningOrder, key)
+		}
+		if rd.Text != "" {
+			cur.Text += rd.Text
+		}
+		if rd.Format != "" {
+			cur.Format = rd.Format
 		}
 	}
 	for _, tc := range c.Delta.ToolCalls {
@@ -96,6 +126,17 @@ func (a *Accumulator) Result() Response {
 	}
 	sort.Slice(tcs, func(i, j int) bool { return tcs[i].Index < tcs[j].Index })
 	msg := Message{Role: RoleAssistant, ToolCalls: tcs}
+	if a.reasoning.Len() > 0 {
+		msg.Reasoning = a.reasoning.String()
+	}
+	if len(a.reasoningDetails) > 0 {
+		msg.ReasoningDetails = make([]ReasoningDetail, 0, len(a.reasoningDetails))
+		for _, key := range a.reasoningOrder {
+			if rd, ok := a.reasoningDetails[key]; ok {
+				msg.ReasoningDetails = append(msg.ReasoningDetails, *rd)
+			}
+		}
+	}
 	if a.text.Len() > 0 {
 		msg.Parts = []Part{{Kind: PartText, Text: a.text.String()}}
 	}

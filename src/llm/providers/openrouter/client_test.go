@@ -110,10 +110,10 @@ func TestStream(t *testing.T) {
 
 		w.Header().Set("Content-Type", "text/event-stream")
 
-		_, _ = w.Write([]byte("data: {\"id\":\"gen-1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"gen-1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\",\"reasoning\":\"Th\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"Th\",\"format\":\"unknown\",\"index\":0}]}}]}\n\n"))
 		flusher.Flush()
 
-		_, _ = w.Write([]byte("data: {\"id\":\"gen-1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"gen-1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"lo\",\"reasoning\":\"ink\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"ink\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":\"stop\"}]}\n\n"))
 		flusher.Flush()
 
 		_, _ = w.Write([]byte("data: {\"id\":\"gen-1\",\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n"))
@@ -164,5 +164,12 @@ func TestStream(t *testing.T) {
 	}
 	if got.FinishReason != llm.FinishStop {
 		t.Fatalf("finish = %q", got.FinishReason)
+	}
+	if got.Message.Reasoning != "Think" {
+		t.Fatalf("reasoning = %q", got.Message.Reasoning)
+	}
+	if len(got.Message.ReasoningDetails) != 1 ||
+		got.Message.ReasoningDetails[0].Text != "Think" {
+		t.Fatalf("reasoning details = %#v", got.Message.ReasoningDetails)
 	}
 }

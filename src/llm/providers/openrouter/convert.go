@@ -110,10 +110,12 @@ func toWireMessage(msg llm.Message) (wireMessage, error) {
 	}
 
 	out := wireMessage{
-		Role:       string(msg.Role),
-		Content:    content,
-		Name:       msg.Name,
-		ToolCallID: msg.ToolCallID,
+		Role:             string(msg.Role),
+		Content:          content,
+		Name:             msg.Name,
+		ToolCallID:       msg.ToolCallID,
+		Reasoning:        msg.Reasoning,
+		ReasoningDetails: toWireReasoningDetails(msg.ReasoningDetails),
 	}
 
 	if len(msg.ToolCalls) > 0 {
@@ -273,10 +275,12 @@ func fromWireMessage(msg wireMessage) (llm.Message, error) {
 	}
 
 	out := llm.Message{
-		Role:       role,
-		Parts:      parts,
-		ToolCallID: msg.ToolCallID,
-		Name:       msg.Name,
+		Role:             role,
+		Parts:            parts,
+		ToolCallID:       msg.ToolCallID,
+		Name:             msg.Name,
+		Reasoning:        msg.Reasoning,
+		ReasoningDetails: fromWireReasoningDetails(msg.ReasoningDetails),
 	}
 
 	for i, call := range msg.ToolCalls {
@@ -352,8 +356,10 @@ func fromWireStreamChoice(id, model string, choice wireChoice) (llm.Chunk, error
 	}
 
 	delta := llm.Message{
-		Role:  llm.RoleAssistant,
-		Parts: parts,
+		Role:             llm.RoleAssistant,
+		Parts:            parts,
+		Reasoning:        choice.Delta.Reasoning,
+		ReasoningDetails: fromWireReasoningDetails(choice.Delta.ReasoningDetails),
 	}
 
 	for _, call := range choice.Delta.ToolCalls {
@@ -415,4 +421,36 @@ func codeString(value any) string {
 		return ""
 	}
 	return fmt.Sprint(value)
+}
+
+func toWireReasoningDetails(details []llm.ReasoningDetail) []wireReasoningDetails {
+	if len(details) == 0 {
+		return nil
+	}
+	out := make([]wireReasoningDetails, 0, len(details))
+	for _, detail := range details {
+		out = append(out, wireReasoningDetails{
+			Type:   detail.Type,
+			Text:   detail.Text,
+			Format: detail.Format,
+			Index:  detail.Index,
+		})
+	}
+	return out
+}
+
+func fromWireReasoningDetails(details []wireReasoningDetails) []llm.ReasoningDetail {
+	if len(details) == 0 {
+		return nil
+	}
+	out := make([]llm.ReasoningDetail, 0, len(details))
+	for _, detail := range details {
+		out = append(out, llm.ReasoningDetail{
+			Type:   detail.Type,
+			Text:   detail.Text,
+			Format: detail.Format,
+			Index:  detail.Index,
+		})
+	}
+	return out
 }

@@ -40,12 +40,21 @@ type ToolCall struct {
 	Arguments json.RawMessage
 }
 
+type ReasoningDetail struct {
+	Type   string
+	Text   string
+	Format string
+	Index  int
+}
+
 type Message struct {
-	Role       Role
-	Parts      []Part
-	ToolCalls  []ToolCall
-	ToolCallID string
-	Name       string
+	Role             Role
+	Parts            []Part
+	ToolCalls        []ToolCall
+	ToolCallID       string
+	Name             string
+	Reasoning        string
+	ReasoningDetails []ReasoningDetail
 }
 
 func (m Message) Text() string {

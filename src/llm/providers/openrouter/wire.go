@@ -20,11 +20,20 @@ type streamOptions struct {
 }
 
 type wireMessage struct {
-	Role       string         `json:"role"`
-	Content    any            `json:"content,omitempty"`
-	Name       string         `json:"name,omitempty"`
-	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
+	Role             string                 `json:"role"`
+	Content          any                    `json:"content,omitempty"`
+	Name             string                 `json:"name,omitempty"`
+	ToolCalls        []wireToolCall         `json:"tool_calls,omitempty"`
+	ToolCallID       string                 `json:"tool_call_id,omitempty"`
+	Reasoning        string                 `json:"reasoning,omitempty"`
+	ReasoningDetails []wireReasoningDetails `json:"reasoning_details,omitempty"`
+}
+
+type wireReasoningDetails struct {
+	Type   string `json:"type"`
+	Text   string `json:"text,omitempty"`
+	Format string `json:"format,omitempty"`
+	Index  int    `json:"index,omitempty"`
 }
 
 type wireContentPart struct {
