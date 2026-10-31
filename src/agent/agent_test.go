@@ -98,9 +98,9 @@ func (c *eventCollector) sink(e Event) {
 
 func TestRunTextResponse(t *testing.T) {
 	client := &fakeClient{responses: []llm.Response{textResponse("hello there")}}
-	agent := &Agent{Name: "a", SystemPrompt: "you are a"}
+	agent := &Agent{Name: "a"}
 
-	res, err := agent.Run(context.Background(), client, "hi")
+	res, err := agent.Run(context.Background(), client, "you are a", "hi")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -124,9 +124,9 @@ func TestRunTextResponse(t *testing.T) {
 
 func TestRunFactsInSystemPrompt(t *testing.T) {
 	client := &fakeClient{responses: []llm.Response{textResponse("ok")}}
-	agent := &Agent{Name: "a", SystemPrompt: "you are a", Facts: []string{"revenue grew 10%", "Q3 filing done"}}
+	agent := &Agent{Name: "a", Facts: []string{"revenue grew 10%", "Q3 filing done"}}
 
-	if _, err := agent.Run(context.Background(), client, "hi"); err != nil {
+	if _, err := agent.Run(context.Background(), client, "you are a", "hi"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	sys := client.requests[0].Messages[0].Text()
@@ -149,7 +149,7 @@ func TestRunToolRoundTrip(t *testing.T) {
 	}}
 	agent := &Agent{Name: "a", Tools: registry}
 
-	res, err := agent.Run(context.Background(), client, "use echo")
+	res, err := agent.Run(context.Background(), client, "", "use echo")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestRunToolErrorFedBack(t *testing.T) {
 	}}
 	agent := &Agent{Name: "a", Tools: registry}
 
-	res, err := agent.Run(context.Background(), client, "go")
+	res, err := agent.Run(context.Background(), client, "", "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestRunUnknownTool(t *testing.T) {
 	}}
 	agent := &Agent{Name: "a", Tools: types.NewRegistry()}
 
-	if _, err := agent.Run(context.Background(), client, "go"); err != nil {
+	if _, err := agent.Run(context.Background(), client, "", "go"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	for _, m := range client.requests[1].Messages {
@@ -231,7 +231,7 @@ func TestRunMaxSteps(t *testing.T) {
 	client := &fakeClient{responses: []llm.Response{resp, resp, resp}}
 	agent := &Agent{Name: "a", Tools: registry, MaxSteps: 2}
 
-	res, err := agent.Run(context.Background(), client, "go")
+	res, err := agent.Run(context.Background(), client, "", "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestRunCancelled(t *testing.T) {
 	cancel()
 	agent := &Agent{Name: "a"}
 
-	res, err := agent.Run(ctx, &fakeClient{}, "go")
+	res, err := agent.Run(ctx, &fakeClient{}, "", "go")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -272,7 +272,7 @@ func TestRunUsageAggregation(t *testing.T) {
 	client := &fakeClient{responses: []llm.Response{r1, r2}}
 	agent := &Agent{Name: "a", Tools: registry}
 
-	res, err := agent.Run(context.Background(), client, "go")
+	res, err := agent.Run(context.Background(), client, "", "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestRunEvents(t *testing.T) {
 	agent := &Agent{Name: "a", Tools: registry}
 
 	coll := &eventCollector{}
-	if _, err := agent.Run(context.Background(), client, "go", WithEvents(coll.sink)); err != nil {
+	if _, err := agent.Run(context.Background(), client, "", "go", WithEvents(coll.sink)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -346,7 +346,7 @@ func TestDelegate(t *testing.T) {
 	orch := &Agent{Name: "orch", Tools: registry, MaxSteps: 2}
 	coll := &eventCollector{}
 
-	res, err := orch.Run(context.Background(), client, "get it done", WithEvents(coll.sink))
+	res, err := orch.Run(context.Background(), client, "", "get it done", WithEvents(coll.sink))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestDelegateEventTree(t *testing.T) {
 	orch := &Agent{Name: "orch", Tools: registry, MaxSteps: 2}
 	coll := &eventCollector{}
 
-	if _, err := orch.Run(context.Background(), client, "go", WithEvents(coll.sink)); err != nil {
+	if _, err := orch.Run(context.Background(), client, "", "go", WithEvents(coll.sink)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -436,7 +436,7 @@ func TestPipeline(t *testing.T) {
 		},
 	}
 
-	res, err := p.Run(context.Background(), client, "start")
+	res, err := p.Run(context.Background(), client, "", "start")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -466,7 +466,7 @@ func TestPipelineFallbackInput(t *testing.T) {
 			{Agent: &Agent{Name: "s2"}}, // no Input, no Map -> prev.FinalText
 		},
 	}
-	if _, err := p.Run(context.Background(), client, "start"); err != nil {
+	if _, err := p.Run(context.Background(), client, "", "start"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if client.requests[1].Messages[1].Text() != "first" {
@@ -486,7 +486,7 @@ func TestPipelineAsDelegate(t *testing.T) {
 	registry.Register(p.AsDelegate(client, "a pipeline"))
 
 	orch := &Agent{Name: "orch", Tools: registry, MaxSteps: 2}
-	res, err := orch.Run(context.Background(), client, "go")
+	res, err := orch.Run(context.Background(), client, "", "go")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -534,7 +534,7 @@ func TestStreamFallback(t *testing.T) {
 	client := &fakeClient{responses: []llm.Response{textResponse("hello")}}
 	agent := &Agent{Name: "a"}
 
-	res, err := agent.Run(context.Background(), client, "hi", WithStream())
+	res, err := agent.Run(context.Background(), client, "", "hi", WithStream())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -579,7 +579,7 @@ func TestRunWithStream(t *testing.T) {
 	agent := &Agent{Name: "a"}
 	coll := &eventCollector{}
 
-	res, err := agent.Run(context.Background(), client, "hi", WithStream(), WithEvents(coll.sink))
+	res, err := agent.Run(context.Background(), client, "", "hi", WithStream(), WithEvents(coll.sink))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}

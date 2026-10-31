@@ -78,7 +78,7 @@ func (a *Agent) Run(ctx context.Context, client llm.ModelClient, systemPrompt st
 	}
 	result := Result{Finish: FinishMaxSteps}
 	defer func() {
-		emit(Event{Kind: EventAgentDone, Step: result.Steps, Usage: &result.Usage, Err: result.Err})
+		emit(Event{Kind: EventAgentDone, Step: result.Steps, Text: result.FinalText, Usage: &result.Usage, Err: result.Err})
 	}()
 
 	// The run context carries run identity so delegate tools can link

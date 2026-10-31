@@ -3,35 +3,41 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
+
+	"vyasa/src/config"
 	"vyasa/src/llm"
 
 	_ "vyasa/src/llm/providers/openrouter"
-
-	"github.com/joho/godotenv"
 )
 
-func loadEnv() {
-	godotenv.Load(".env")
-}
-
 func main() {
-	loadEnv()
-	orConfig := llm.Config{
-		APIKey:       os.Getenv("OPENROUTER_API_KEY"),
-		DefaultModel: "z-ai/glm-5.3-flash",
+	if err := config.LoadDotEnv(".env"); err != nil {
+		panic(err)
 	}
-	if orConfig.APIKey == "" {
-		panic("OPENROUTER_API_KEY not set")
+
+	settings, err := config.Load("config.json")
+	if err != nil {
+		panic(err)
 	}
-	client, err := llm.NewClient("openrouter", orConfig)
+
+	apiKey, err := config.RequireSecret("OPENROUTER_API_KEY")
+	if err != nil {
+		panic(err)
+	}
+
+	client, err := llm.NewClient(settings.Provider, llm.Config{
+		APIKey:       apiKey,
+		DefaultModel: settings.Model,
+		MaxRetries:   settings.MaxRetries,
+		Timeout:      settings.Timeout(),
+	})
 	if err != nil {
 		panic(err)
 	}
 
 	ctx := context.Background()
 	req := llm.Request{
-		Model: "z-ai/glm-5.3-flash",
+		Model: settings.Model,
 		Messages: []llm.Message{
 			{Role: "user",
 				Parts: []llm.Part{
