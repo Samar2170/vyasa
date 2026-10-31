@@ -25,6 +25,15 @@ type DelegateTool struct {
 
 var _ types.Tool = (*DelegateTool)(nil)
 
+func NewDelegateTool(name, description string, runner Runner, client llm.ModelClient) *DelegateTool {
+	return &DelegateTool{
+		runner:      runner,
+		client:      client,
+		name:        name,
+		description: description,
+		params:      json.RawMessage(defaultDelegateParams),
+	}
+}
 func (d *DelegateTool) Name() string        { return d.name }
 func (d *DelegateTool) Description() string { return d.description }
 func (d *DelegateTool) Parameters() json.RawMessage {
