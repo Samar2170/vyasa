@@ -31,6 +31,12 @@ func TestLoadDefaultsWhenPathEmpty(t *testing.T) {
 	if s.Timeout() != DefaultTimeoutSec*time.Second {
 		t.Errorf("Timeout = %v", s.Timeout())
 	}
+	if s.StorageParentFolder != DefaultStorageParentFolder {
+		t.Errorf("StorageParentFolder = %q", s.StorageParentFolder)
+	}
+	if s.StorageSchema != DefaultStorageSchema {
+		t.Errorf("StorageSchema = %q", s.StorageSchema)
+	}
 }
 
 func writeTemp(t *testing.T, name, content string) string {

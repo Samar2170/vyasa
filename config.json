@@ -1,4 +1,7 @@
 {
   "provider": "openrouter",
-  "model": "z-ai/glm-5.3-flash"
+  "model": "z-ai/glm-5.3-flash",
+  "tickertape_max_requests_per_day": 5,
+  "storage_parent_folder": "financial_data",
+  "storage_schema": "vyasa"
 }

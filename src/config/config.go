@@ -42,7 +42,22 @@ type Settings struct {
 	MaxSteps   int    `json:"max_steps"`
 	TimeoutSec int    `json:"timeout_sec"`
 	MaxRetries *int   `json:"max_retries"`
+	// TickertapeMaxRequestsPerDay caps the live tickertapev2 stock-page
+	// fetches per calendar day.
+	TickertapeMaxRequestsPerDay int `json:"tickertape_max_requests_per_day"`
+	// StorageParentFolder is the root Archivus folder all archived data is
+	// filed under.
+	StorageParentFolder string `json:"storage_parent_folder"`
+	// StorageSchema is the PostgreSQL schema the store bootstraps and uses
+	// for all tables. Empty disables bootstrapping (plain public default).
+	StorageSchema string `json:"storage_schema"`
 }
+
+const (
+	DefaultTickertapeMaxRequestsPerDay = 5
+	DefaultStorageParentFolder         = "financial_data"
+	DefaultStorageSchema               = "vyasa"
+)
 
 // Timeout returns the configured timeout as a duration.
 func (s Settings) Timeout() time.Duration {
@@ -58,6 +73,15 @@ func (s *Settings) withDefaults() {
 	}
 	if s.TimeoutSec <= 0 {
 		s.TimeoutSec = DefaultTimeoutSec
+	}
+	if s.TickertapeMaxRequestsPerDay <= 0 {
+		s.TickertapeMaxRequestsPerDay = DefaultTickertapeMaxRequestsPerDay
+	}
+	if s.StorageParentFolder == "" {
+		s.StorageParentFolder = DefaultStorageParentFolder
+	}
+	if s.StorageSchema == "" {
+		s.StorageSchema = DefaultStorageSchema
 	}
 }
 

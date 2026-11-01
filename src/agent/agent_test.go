@@ -22,8 +22,8 @@ type fakeClient struct {
 	err       error
 }
 
-func (f *fakeClient) Name() string                       { return "fake" }
-func (f *fakeClient) Capabilities() llm.Capabilities     { return llm.Capabilities{Tools: true} }
+func (f *fakeClient) Name() string                   { return "fake" }
+func (f *fakeClient) Capabilities() llm.Capabilities { return llm.Capabilities{Tools: true} }
 func (f *fakeClient) Stream(_ context.Context, _ llm.Request) (llm.Stream, error) {
 	return nil, llm.ErrStreamingUnsupported
 }
@@ -72,8 +72,8 @@ type stubTool struct {
 	fn    func(args string) types.ExecutionOutput
 }
 
-func (s *stubTool) Name() string            { return s.name }
-func (s *stubTool) Description() string     { return "stub " + s.name }
+func (s *stubTool) Name() string                { return s.name }
+func (s *stubTool) Description() string         { return "stub " + s.name }
 func (s *stubTool) Parameters() json.RawMessage { return nil }
 func (s *stubTool) Execute(_ context.Context, args string) types.ExecutionOutput {
 	s.mu.Lock()
