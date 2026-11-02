@@ -2,7 +2,7 @@
 // (config.json), PostgreSQL and Archivus storage into the subcommands:
 //
 //	vyasa seed [-file EQUITY_L.csv]
-//	vyasa collect -symbol RELIANCE [-source indiasm,tickertapev2,av]
+//	vyasa collect -symbol RELIANCE [-source indiasm,tickertape,tickertapev2,av]
 package main
 
 import (
@@ -58,7 +58,7 @@ func main() {
 	case "collect":
 		fs := flag.NewFlagSet("collect", flag.ExitOnError)
 		symbol := fs.String("symbol", "", "company symbol to collect data for")
-		sources := fs.String("source", "indiasm,tickertapev2,av", "comma-separated data sources (tickertapev2 falls back to saved pages)")
+		sources := fs.String("source", "indiasm,tickertapev2,av", "comma-separated data sources (tickertapev2 falls back to saved pages; tickertape reads saved pages only)")
 		_ = fs.Parse(os.Args[2:])
 		if *symbol == "" {
 			log.Fatal("collect requires -symbol SYMBOL")
@@ -85,7 +85,8 @@ func usage() {
 commands:
   seed      load EQUITY_L.csv companies into PostgreSQL (-file, default EQUITY_L.csv)
   collect   fetch data for one company: -symbol RELIANCE
-            -source indiasm,tickertapev2,av (tickertapev2 scrapes live pages,
+            -source indiasm,tickertape,tickertapev2,av (tickertape reads saved
+            pages from tickertape_files/ directly; tickertapev2 scrapes live pages,
             capped per day by config.json; when it fails it falls back to
             saved pages in tickertape_files/)
   ir        fetch and archive investor-relations filings (annual report,
@@ -154,7 +155,7 @@ func runCollect(ctx context.Context, st *store.Store, storage client.StorageClie
 	srcs, fallbacks := dataSources(st, storage, settings)
 	for _, name := range sources {
 		if _, ok := srcs[name]; !ok {
-			log.Fatalf("collect: unknown source %q (want: indiasm, tickertapev2, av)", name)
+			log.Fatalf("collect: unknown source %q (want: indiasm, tickertape, tickertapev2, av)", name)
 		}
 	}
 
@@ -202,12 +203,13 @@ func runCollect(ctx context.Context, st *store.Store, storage client.StorageClie
 // error) it falls back to the file-based tickertape client reading saved
 // pages from tickertape_files/.
 func dataSources(st *store.Store, storage client.StorageClient, settings config.Settings) (sources, fallbacks map[string]client.DataSourceClient) {
-	sources = make(map[string]client.DataSourceClient, 3)
+	sources = make(map[string]client.DataSourceClient, 4)
 	fallbacks = make(map[string]client.DataSourceClient, 1)
 
 	if primary := config.Secret("INDIAN_SM_API_KEY"); primary != "" || config.Secret("INDIAN_SM_API_KEY2") != "" {
 		sources["indiasm"] = indiasm.New(primary, config.Secret("INDIAN_SM_API_KEY2"), storage, st)
 	}
+	sources["tickertape"] = tickertape.New(storage, st)
 	sources["tickertapev2"] = tickertapev2.New(settings.TickertapeMaxRequestsPerDay, storage, st)
 	fallbacks["tickertapev2"] = tickertape.New(storage, st)
 	if key := config.Secret("ALPHAVANTAGE_API_KEY"); key != "" {

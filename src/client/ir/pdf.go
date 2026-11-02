@@ -3,6 +3,7 @@ package ir
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,11 @@ import (
 
 	"github.com/ledongthuc/pdf"
 )
+
+// errNotPDF marks a download that answered with something other than a PDF
+// (usually an HTML listing page); callers use it as the signal to look one
+// level deeper for document links on that page.
+var errNotPDF = errors.New("response is not a PDF")
 
 // download fetches a filing PDF with browser headers (IR sites commonly
 // require a Referer) and verifies it really is a PDF.
@@ -37,7 +43,7 @@ func (c *Client) download(ctx context.Context, u, referer string) ([]byte, error
 		return nil, fmt.Errorf("ir: %s: file exceeds %d bytes", u, maxDocBytes)
 	}
 	if len(data) < 1024 || !bytes.Contains(data[:1024], []byte("%PDF")) {
-		return nil, fmt.Errorf("ir: %s: response is not a PDF", u)
+		return nil, fmt.Errorf("ir: %s: %w", u, errNotPDF)
 	}
 	return data, nil
 }

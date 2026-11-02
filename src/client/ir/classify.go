@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"vyasa/src/llm"
 	"vyasa/src/models"
@@ -37,6 +38,10 @@ var segmentMatchers = []struct {
 // Q1 FY26, quarter 3...).
 var quarterlyHint = regexp.MustCompile(`(?i)(?:^|[^a-z])q([1-4])(?:fy|\b|[^a-z0-9])`)
 
+// nameWindow is how far back a document URL may sit from its record's
+// "name"/"title" field in an embedded JSON payload.
+const nameWindow = 800
+
 // denylist keeps compliance noise (policies, certificates, shareholding
 // patterns...) out of the candidate pool.
 var denylist = []string{
@@ -45,7 +50,7 @@ var denylist = []string{
 	"notice", "reconciliation", "subsidiar", "compliance under", "certificate under",
 	"investor education", "protection fund", "iepf", "unpaid dividend", "demateriali",
 	"kyc", "nomination", "debenture trustee", "terms of use", "privacy", "contact us",
-	"headquarters",
+	"headquarters", "voting", "scrutinizer", "scrutiniser", "monitoring agency",
 }
 
 var (
@@ -140,8 +145,102 @@ func (c *Client) fetchHTML(ctx context.Context, pageURL string) ([]byte, error) 
 	return io.ReadAll(io.LimitReader(resp.Body, maxPageBytes))
 }
 
-// candidatesFromPage fetches one IR page and returns its absolute links. It
-// also synthesises candidates for the page's filter dropdowns (e.g. a "Report
+// jsonFlatten unescapes the escape sequences embedded JSON payloads (Next.js
+// flight data, __NEXT_DATA__, CMS blobs) wrap their strings in, so plain
+// string scans can find quoted values inside them.
+var jsonFlatten = strings.NewReplacer(
+	`\"`, `"`,
+	`\/`, "/",
+	`\u0026`, "&",
+	`\u002F`, "/", `\u002f`, "/",
+	`\u003C`, "<", `\u003c`, "<",
+	`\u003E`, ">", `\u003e`, ">",
+)
+
+var (
+	// jsonPDFRe matches quoted .pdf URLs anywhere in a flattened payload.
+	jsonPDFRe = regexp.MustCompile(`(?i)"([^"\s]+\.pdf)"`)
+	// jsonNameRe matches non-empty "name"/"title" values used as record titles.
+	jsonNameRe = regexp.MustCompile(`"(?:name|title)":"([^"]{2,200})"`)
+	// jsonPageRe matches internal page references ("url":"/investor/...").
+	jsonPageRe = regexp.MustCompile(`"url":"(/[^"\s]+)"`)
+)
+
+// jsonCandidates mines an embedded JSON payload for documents and internal
+// pages. JS-rendered IR sites ship their filing lists this way instead of as
+// <a href> anchors, so scraping raw HTML alone finds nothing. Each document
+// is paired with the nearest preceding "name"/"title" value (the record's own
+// title) so classification and recency ranking still work.
+func jsonCandidates(base *url.URL, body []byte, pageURL string) []candidate {
+	flat := jsonFlatten.Replace(string(body))
+	if !strings.Contains(flat, ".pdf") && !strings.Contains(flat, `"url":"`) {
+		return nil
+	}
+
+	names := jsonNameRe.FindAllStringSubmatchIndex(flat, -1)
+	pdfs := jsonPDFRe.FindAllStringSubmatchIndex(flat, -1)
+
+	var out []candidate
+	seen := map[string]bool{}
+	ni := 0
+	for _, loc := range pdfs {
+		start := loc[2]
+		for ni < len(names)-1 && names[ni+1][3] <= start {
+			ni++
+		}
+		text := ""
+		if ni < len(names) && names[ni][3] <= start && start-names[ni][3] <= nameWindow {
+			text = flat[names[ni][2]:names[ni][3]]
+		}
+		abs := absoluteURL(base, flat[start:loc[3]])
+		if abs == "" || isSocialURL(abs) || seen[abs] {
+			continue
+		}
+		seen[abs] = true
+		out = append(out, candidate{URL: abs, Text: text, PageURL: pageURL})
+	}
+	for _, m := range jsonPageRe.FindAllStringSubmatch(flat, -1) {
+		abs := absoluteURL(base, m[1])
+		if abs == "" || isSocialURL(abs) || seen[abs] || !sameSiteURL(abs, pageURL) {
+			continue
+		}
+		seen[abs] = true
+		out = append(out, candidate{URL: abs, PageURL: pageURL})
+	}
+	return out
+}
+
+// pageCandidates returns every link candidate on one fetched page: <a href>
+// anchors plus anything referenced by the page's embedded JSON payloads.
+// Payloads usually repeat the visible links, so URL-level dedupe keeps the
+// anchor text when both exist.
+func pageCandidates(base *url.URL, body []byte, pageURL string) []candidate {
+	var out []candidate
+	seen := map[string]bool{}
+	add := func(cand candidate) bool {
+		if cand.URL == "" || seen[cand.URL] {
+			return false
+		}
+		seen[cand.URL] = true
+		out = append(out, cand)
+		return true
+	}
+	for _, n := range anchors(body) {
+		abs := absoluteURL(base, attr(n, "href"))
+		if abs == "" || isSocialURL(abs) {
+			continue
+		}
+		add(candidate{URL: abs, Text: nodeText(n), PageURL: pageURL})
+	}
+	for _, cand := range jsonCandidates(base, body, pageURL) {
+		add(cand)
+	}
+	return out
+}
+
+// candidatesFromPage fetches one IR page and returns its absolute links —
+// anchors, JSON-payload references and filter-dropdown listing URLs. It also
+// synthesises candidates for the page's filter dropdowns (e.g. a "Report
 // category" select), so documents hidden behind a category query parameter are
 // discovered even when they never appear as anchors.
 func (c *Client) candidatesFromPage(ctx context.Context, pageURL string) ([]candidate, error) {
@@ -155,14 +254,7 @@ func (c *Client) candidatesFromPage(ctx context.Context, pageURL string) ([]cand
 		return nil, err
 	}
 
-	var out []candidate
-	for _, n := range anchors(body) {
-		abs := absoluteURL(base, attr(n, "href"))
-		if abs == "" || isSocialURL(abs) {
-			continue
-		}
-		out = append(out, candidate{URL: abs, Text: nodeText(n), PageURL: pageURL})
-	}
+	out := pageCandidates(base, body, pageURL)
 	out = append(out, filterCandidates(base, body, pageURL)...)
 	return out, nil
 }
@@ -362,7 +454,8 @@ func subPageScore(cand candidate) int {
 	score := 0
 	for _, kw := range []string{
 		"annual report", "presentations", "presentation", "results", "financials",
-		"financial result", "quarterly", "transcript", "reports", "performance", "filing",
+		"financial result", "financial information", "quarterly", "transcript",
+		"reports", "performance", "filing", "annual", "financial",
 	} {
 		if strings.Contains(joined, kw) {
 			score += 2
@@ -425,8 +518,9 @@ func missingSegments(picks map[string][]filing) []string {
 
 // expandListings replaces non-PDF picks (listing / flipbook pages) with the
 // segment-relevant PDFs linked on those pages, so downloads only chase real
-// documents. Results are cached per page URL across calls.
-func (c *Client) expandListings(ctx context.Context, co models.Company, picks map[string][]filing, cache map[string][]filing) map[string][]filing {
+// documents. Results are cached per page URL across calls; mu guards the
+// cache when harvests also run from fetchAndParse workers.
+func (c *Client) expandListings(ctx context.Context, co models.Company, picks map[string][]filing, cache map[string][]filing, mu *sync.Mutex) map[string][]filing {
 	for seg, list := range picks {
 		var pdfs, listings []filing
 		taken := map[string]bool{}
@@ -447,12 +541,7 @@ func (c *Client) expandListings(ctx context.Context, co models.Company, picks ma
 			if !sameSiteURL(f.URL, f.PageURL) {
 				continue // external page (share widget etc), not a listing
 			}
-			found, ok := cache[f.URL]
-			if !ok {
-				found = c.pdfsOnPage(ctx, co, seg, f)
-				cache[f.URL] = found
-			}
-			for _, g := range found {
+			for _, g := range c.expandedListing(ctx, co, seg, f, cache, mu) {
 				if taken[g.URL] {
 					continue
 				}
@@ -478,6 +567,9 @@ func (c *Client) expandListings(ctx context.Context, co models.Company, picks ma
 // pdfsOnPage fetches a listing page and returns the documents on it that
 // belong to seg: PDFs matching the segment plus download endpoints (e.g.
 // /print/pdf/<id>) which have no .pdf suffix but still serve a document.
+// When the page itself offers no such document it goes one step further and
+// follows the record-list pagination the page's payload advertises, so
+// filings hidden behind a "show more" API are still discovered.
 func (c *Client) pdfsOnPage(ctx context.Context, co models.Company, seg string, listing filing) []filing {
 	body, err := c.fetchHTML(ctx, listing.URL)
 	if err != nil {
@@ -489,17 +581,22 @@ func (c *Client) pdfsOnPage(ctx context.Context, co models.Company, seg string, 
 		return nil
 	}
 
+	out := docLinksOnBody(base, body, listing.URL, seg)
+	if len(out) == 0 {
+		out = c.paginatedListingDocs(ctx, co, seg, listing, body)
+	}
+	return out
+}
+
+// docLinksOnBody harvests the documents on one fetched page that belong to
+// seg: segment-relevant PDFs plus download endpoints.
+func docLinksOnBody(base *url.URL, body []byte, pageURL, seg string) []filing {
 	var out []filing
-	for _, n := range anchors(body) {
-		abs := absoluteURL(base, attr(n, "href"))
-		if abs == "" || isSocialURL(abs) {
-			continue
-		}
-		cand := candidate{URL: abs, Text: nodeText(n), PageURL: listing.URL}
+	for _, cand := range pageCandidates(base, body, pageURL) {
 		if !isDocLink(seg, cand) {
 			continue
 		}
-		out = append(out, filing{Segment: seg, URL: abs, Text: cand.Text, PageURL: listing.URL})
+		out = append(out, filing{Segment: seg, URL: cand.URL, Text: cand.Text, PageURL: pageURL})
 	}
 	return out
 }

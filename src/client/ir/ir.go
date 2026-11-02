@@ -16,6 +16,7 @@ package ir
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -45,14 +46,16 @@ const (
 	storageSubFolder = "ir_filings"
 	sourceIR         = "investor_relations"
 
-	maxDocBytes      = 100 << 20 // refuse PDFs above 100 MB
-	maxPageBytes     = 2 << 20   // bytes of HTML read per page
-	maxSubPages      = 8         // extra IR sub-pages crawled for candidates
-	maxCandidatesLLM = 80        // link list size offered to the LLM agent
-	maxTriesPerSeg   = 3         // download attempts per segment
-	maxListings      = 12        // listing/filter pages expanded per segment
-	httpTimeout      = 3 * time.Minute
-	dayFormat        = "2006-01-02"
+	maxDocBytes        = 100 << 20 // refuse PDFs above 100 MB
+	maxPageBytes       = 2 << 20   // bytes of HTML read per page
+	maxSubPages        = 8         // extra IR sub-pages crawled for candidates
+	maxCandidatesLLM   = 80        // link list size offered to the LLM agent
+	maxTriesPerSeg     = 3         // download attempts per segment
+	maxListings        = 12        // listing/filter pages expanded per segment
+	maxListingPages    = 3         // record pages fetched from a listing API
+	listingRecordLimit = 100       // records requested per listing API page
+	httpTimeout        = 3 * time.Minute
+	dayFormat          = "2006-01-02"
 )
 
 var _ client.DataSourceClient = (*Client)(nil)
@@ -121,16 +124,17 @@ func (c *Client) Execute(ctx context.Context, co models.Company) error {
 	}
 	picks := selectFilings(cands)
 	listings := map[string][]filing{}
-	picks = c.expandListings(ctx, co, picks, listings)
+	var listingsMu sync.Mutex
+	picks = c.expandListings(ctx, co, picks, listings, &listingsMu)
 	if len(picks) == 0 {
 		return fmt.Errorf("ir: %s: no filings found on %s", co.Symbol, links.IR)
 	}
 	if missing := missingSegments(picks); len(missing) > 0 {
 		picks = c.llmAssist(ctx, co, cands, picks, missing)
-		picks = c.expandListings(ctx, co, picks, listings)
+		picks = c.expandListings(ctx, co, picks, listings, &listingsMu)
 	}
 
-	results := c.fetchAndParse(ctx, co, picks)
+	results := c.fetchAndParse(ctx, co, picks, listings, &listingsMu)
 	if len(results) == 0 {
 		return fmt.Errorf("ir: %s: no filings could be downloaded", co.Symbol)
 	}
@@ -142,7 +146,7 @@ func (c *Client) Execute(ctx context.Context, co models.Company) error {
 
 // fetchAndParse downloads the picked PDFs and extracts plain text from each,
 // one worker per segment.
-func (c *Client) fetchAndParse(ctx context.Context, co models.Company, picks map[string][]filing) []filingResult {
+func (c *Client) fetchAndParse(ctx context.Context, co models.Company, picks map[string][]filing, listings map[string][]filing, listingsMu *sync.Mutex) []filingResult {
 	day := time.Now()
 	var wg sync.WaitGroup
 	results := make([]filingResult, len(segmentOrder))
@@ -163,12 +167,12 @@ func (c *Client) fetchAndParse(ctx context.Context, co models.Company, picks map
 			var data []byte
 			var used filing
 			for _, f := range list {
-				body, err := c.download(ctx, f.URL, f.PageURL)
+				body, got, err := c.pickDownload(ctx, co, seg, f, listings, listingsMu)
 				if err != nil {
 					log.Printf("[ir] %s: %s: download %s: %v", co.Symbol, seg, f.URL, err)
 					continue
 				}
-				data, used = body, f
+				data, used = body, got
 				break
 			}
 			if data == nil {
@@ -198,6 +202,51 @@ func (c *Client) fetchAndParse(ctx context.Context, co models.Company, picks map
 
 	results = slices.DeleteFunc(results, func(r filingResult) bool { return r.PDF == nil })
 	return results
+}
+
+// pickDownload downloads filing f. When f turns out to be an HTML page
+// (a listing rather than a document) it goes one step further: the documents
+// offered on that page are harvested and tried, so a listing picked for
+// download still yields a filing. Harvests share the expandListings cache.
+func (c *Client) pickDownload(ctx context.Context, co models.Company, seg string, f filing, listings map[string][]filing, listingsMu *sync.Mutex) ([]byte, filing, error) {
+	body, err := c.download(ctx, f.URL, f.PageURL)
+	if err == nil {
+		return body, f, nil
+	}
+	if !errors.Is(err, errNotPDF) {
+		return nil, filing{}, err
+	}
+
+	docs := c.expandedListing(ctx, co, seg, f, listings, listingsMu)
+	if len(docs) > maxTriesPerSeg {
+		docs = docs[:maxTriesPerSeg]
+	}
+	for _, g := range docs {
+		log.Printf("[ir] %s: %s: %s is a listing page, trying %s linked on it", co.Symbol, seg, f.URL, g.URL)
+		b, derr := c.download(ctx, g.URL, g.PageURL)
+		if derr == nil {
+			return b, g, nil
+		}
+		log.Printf("[ir] %s: %s: download %s: %v", co.Symbol, seg, g.URL, derr)
+	}
+	return nil, filing{}, err
+}
+
+// expandedListing returns the document filings found on listing page f, using
+// and filling the shared expansion cache; listingsMu guards the cache when
+// harvests run concurrently from fetchAndParse workers.
+func (c *Client) expandedListing(ctx context.Context, co models.Company, seg string, f filing, listings map[string][]filing, listingsMu *sync.Mutex) []filing {
+	listingsMu.Lock()
+	found, ok := listings[f.URL]
+	listingsMu.Unlock()
+	if ok {
+		return found
+	}
+	found = c.pdfsOnPage(ctx, co, seg, f)
+	listingsMu.Lock()
+	listings[f.URL] = found
+	listingsMu.Unlock()
+	return found
 }
 
 // archiveAndRecord uploads the PDFs and their parsed text to the same

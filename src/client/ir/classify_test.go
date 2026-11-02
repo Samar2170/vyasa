@@ -1,10 +1,19 @@
 package ir
 
 import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"vyasa/src/models"
 )
 
 func TestClassify(t *testing.T) {
@@ -236,6 +245,213 @@ func TestIsDownloadLink(t *testing.T) {
 	}
 }
 
+func TestJSONCandidates(t *testing.T) {
+	// Next.js flight-data style payload: record JSON escaped inside
+	// self.__next_f.push([1,"..."]) script strings, like waaree.com ships
+	// (each quote carries one backslash in the raw HTML).
+	body := []byte(`<script>self.__next_f.push([1,"...{\"id\":2902,\"template_name\":\"Investors\",\"name\":\"Q1 Investor Presentation 2026-27\",\"slug\":\"/q1-investor-presentation-2026-27\",\"meta\":{\"title\":null},\"template_fields\":{\"document\":{\"src\":\"/upload/media/investorpresentation_signed_1_1785396912.pdf\"}}},{\"id\":2961,\"name\":\"Q1 Transcript of Call 2026-27\",\"template_fields\":{\"document\":{\"src\":\"/upload/media/waaree_energies_ltd_q1_fy27_earnings_call_transcript_1786015347.pdf\"}}},{\"link\":{\"title\":\"Annual Report\",\"url_type\":\"internal\",\"url\":\"/investor/annual-report\"}}..."])</script>`)
+	base, _ := mustParse("https://www.waaree.com/investor/")
+
+	cands := jsonCandidates(base, body, "https://www.waaree.com/investor/")
+	if len(cands) != 3 {
+		t.Fatalf("jsonCandidates = %d items, want 3: %+v", len(cands), cands)
+	}
+	byURL := map[string]candidate{}
+	for _, c := range cands {
+		byURL[c.URL] = c
+	}
+	pres := byURL["https://www.waaree.com/upload/media/investorpresentation_signed_1_1785396912.pdf"]
+	if pres.Text != "Q1 Investor Presentation 2026-27" {
+		t.Fatalf("presentation text = %q, want its record name", pres.Text)
+	}
+	if got := classify(pres); got != SegPresentation {
+		t.Fatalf("classify(presentation record) = %q, want %q", got, SegPresentation)
+	}
+	trans := byURL["https://www.waaree.com/upload/media/waaree_energies_ltd_q1_fy27_earnings_call_transcript_1786015347.pdf"]
+	if got := classify(trans); got != SegTranscript {
+		t.Fatalf("classify(transcript record) = %q, want %q", got, SegTranscript)
+	}
+	if y, q := recency(trans.URL + " " + trans.Text); y != 2027 || q != 1 {
+		t.Fatalf("recency(transcript) = (%d, %d), want (2027, 1)", y, q)
+	}
+	if _, ok := byURL["https://www.waaree.com/investor/annual-report"]; !ok {
+		t.Fatal("internal page reference not harvested")
+	}
+}
+
+func TestJSONCandidatesIgnoresNoise(t *testing.T) {
+	body := []byte(`{"a":"x.pdf not quoted","b":"https://facebook.com/share.pdf","c":"","url":"/policies","items":[{"name":"Shareholding Pattern","src":"/upload/media/shareholding.pdf"},{"name":"Code of Conduct Policy","src":"/upload/media/policy.pdf"}]}`)
+	base, _ := mustParse("https://ir.example.com/")
+	cands := jsonCandidates(base, body, "https://ir.example.com/")
+	for _, c := range cands {
+		if strings.Contains(c.URL, "facebook.com") {
+			t.Fatalf("social URL leaked: %s", c.URL)
+		}
+		if classify(c) != "" {
+			t.Fatalf("denylisted candidate leaked: %+v", c)
+		}
+	}
+}
+
+func TestPageCandidatesMergesAnchorsAndJSON(t *testing.T) {
+	body := []byte(`<a href="/reports/ar.pdf">Annual Report</a>
+		<script>self.__next_f.push([1,"{\"name\":\"Investor Presentation Q2\",\"template_fields\":{\"document\":{\"src\":\"/upload/media/ip.pdf\"}}}"])</script>`)
+	base, _ := mustParse("https://ir.example.com/investors/")
+	cands := pageCandidates(base, body, base.String())
+	if len(cands) != 2 {
+		t.Fatalf("pageCandidates = %d, want 2: %+v", len(cands), cands)
+	}
+	if cands[0].Text != "Annual Report" || cands[1].Text != "Investor Presentation Q2" {
+		t.Fatalf("candidate texts = %q, %q", cands[0].Text, cands[1].Text)
+	}
+}
+
 func mustParse(u string) (*url.URL, error) {
 	return url.Parse(u)
+}
+
+// fakePDF returns byte counts that pass download's PDF sniffing.
+func fakePDF() []byte {
+	b := make([]byte, 2048)
+	copy(b, "%PDF-1.4\n")
+	return b
+}
+
+func TestFindListingPagination(t *testing.T) {
+	// Flight-data style payload (quotes escaped) as waaree.com ships it.
+	flat := jsonFlatten.Replace(`self.__next_f.push([1,"...{\"pages\":{\"filters\":{\"url\":\"/filter-data\",\"template_id\":\"20\",\"limit\":8},\"current_page\":1,\"total_pages\":4,\"limit\":8,\"total_items\":32},\"filter_list\":[{\"id\":32,\"name\":\"Year\",\"tags\":[]}],\"conditions\":[],\"tag_conditions\":[{\"id\":\"30\",\"value\":\"478\"}],\"sort\":{\"sort_by\":\"published_date\",\"sort_type\":\"desc\"}}..."])`)
+	spec := findListingPagination(flat)
+	if spec == nil {
+		t.Fatal("findListingPagination = nil, want a spec")
+	}
+	if spec.Path != "/filter-data" || spec.TemplateID != "20" || spec.Limit != 8 || spec.TotalPages != 4 {
+		t.Fatalf("spec = %+v", spec)
+	}
+	if spec.TagConditions != `[{"id":"30","value":"478"}]` {
+		t.Fatalf("tag_conditions = %q", spec.TagConditions)
+	}
+	if spec.Conditions != `[]` || spec.Sort != `{"sort_by":"published_date","sort_type":"desc"}` {
+		t.Fatalf("conditions/sort = %q / %q", spec.Conditions, spec.Sort)
+	}
+
+	// Single-page lists and non-API "pages" keys are ignored.
+	if findListingPagination(`{"pages":{"filters":{"url":"/x","template_id":"1","limit":8},"total_pages":1,"total_items":8}}`) != nil {
+		t.Fatal("single-page list should not yield a spec")
+	}
+	if findListingPagination(`{"pages":{"title":"Other"}}`) != nil {
+		t.Fatal("unrelated pages object should not yield a spec")
+	}
+}
+
+func TestListingRequestBodyAndEndpoints(t *testing.T) {
+	spec := &listingPagination{
+		Path: "/filter-data", TemplateID: "20", Limit: 8, TotalPages: 4,
+		Conditions: `[]`, TagConditions: `[{"id":"30","value":"478"}]`,
+		Sort: `{"sort_by":"published_date","sort_type":"desc"}`,
+	}
+	got := listingRequestBody(spec, 2, 100, false)
+	want := `{"template_id":"20","page":2,"limit":100,"tags":{},"conditions":[],"tag_conditions":[{"id":"30","value":"478"}],"sort":{"sort_by":"published_date","sort_type":"desc"}}`
+	if got != want {
+		t.Fatalf("listingRequestBody = %s, want %s", got, want)
+	}
+	if withCtx := listingRequestBody(spec, 1, 8, true); !strings.Contains(withCtx, `"store":"global","locale":"en"`) {
+		t.Fatalf("context request = %s", withCtx)
+	}
+
+	eps := listingEndpoints("https://www.waaree.com/investor/annual-report", "/filter-data")
+	wantEps := []string{
+		"https://www.waaree.com/filter-data",
+		"https://www.waaree.com/api/filter-data",
+		"https://api.waaree.com/api/filter-data",
+		"https://api.waaree.com/filter-data",
+	}
+	if !slices.Equal(eps, wantEps) {
+		t.Fatalf("listingEndpoints = %v, want %v", eps, wantEps)
+	}
+}
+
+func TestPaginatedListingDocs(t *testing.T) {
+	listingPage := `<html><body><a href="/upload/media/draft_mgt_7.pdf">Draft Annual Return FY 2025 - 26</a>
+		<script>self.__next_f.push([1,"{\"pages\":{\"filters\":{\"url\":\"/filter-data\",\"template_id\":\"20\",\"limit\":8},\"current_page\":1,\"total_pages\":4,\"limit\":8,\"total_items\":32},\"conditions\":[],\"tag_conditions\":[{\"id\":\"30\",\"value\":\"478\"}],\"sort\":{\"sort_by\":\"published_date\",\"sort_type\":\"desc\"}}"])</script>
+	</body></html>`
+	var seenBodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/investor/annual-report" {
+			fmt.Fprint(w, listingPage)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		seenBodies = append(seenBodies, string(body))
+		if !strings.Contains(string(body), `"store"`) {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"errors":{"error":"Invalid or missing store\/locale context"},"status":false}`)
+			return
+		}
+		fmt.Fprint(w, `{"list":[`+
+			`{"name":"Annual Report FY 2025 - 26","template_fields":{"document":{"src":"\/upload\/media\/annualreport_25_26.pdf"}},"tag_data":{"type":[{"name":"Annual Report"}]}},`+
+			`{"name":"Notice of AGM FY 2025 - 26","template_fields":{"document":{"src":"\/upload\/media\/notice_of_agm.pdf"}}},`+
+			`{"name":"Annual Return (MGT-7) FY 2024-25","template_fields":{"document":{"src":"\/upload\/media\/mgt_7.pdf"}}}`+
+			`],"pages":{"filters":{"url":"/filter-data","template_id":"20","limit":100},"current_page":1,"total_pages":1,"total_items":3}}`)
+	}))
+	defer srv.Close()
+
+	c := &Client{hc: srv.Client()}
+	co := models.Company{Symbol: "TEST"}
+	listing := filing{Segment: SegAnnualReport, URL: srv.URL + "/investor/annual-report", PageURL: srv.URL}
+
+	got := c.pdfsOnPage(context.Background(), co, SegAnnualReport, listing)
+	if len(got) != 1 {
+		t.Fatalf("pdfsOnPage = %+v, want the single annual report", got)
+	}
+	if want := srv.URL + "/upload/media/annualreport_25_26.pdf"; got[0].URL != want {
+		t.Fatalf("pick = %s, want %s", got[0].URL, want)
+	}
+	if got[0].PageURL != listing.URL {
+		t.Fatalf("pick page = %s, want %s", got[0].PageURL, listing.URL)
+	}
+	if len(seenBodies) != 2 {
+		t.Fatalf("api calls = %d (%v), want 2 (bare request + context retry)", len(seenBodies), seenBodies)
+	}
+}
+
+func TestFetchAndParseListingFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ar":
+			fmt.Fprint(w, `<html><body><h1>Annual Reports</h1><a href="/real.pdf">Annual Report FY 2025 - 26</a></body></html>`)
+		case "/real.pdf":
+			w.Write(fakePDF())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := &Client{hc: srv.Client()}
+	co := models.Company{Symbol: "TEST"}
+	picks := map[string][]filing{
+		SegAnnualReport: {{Segment: SegAnnualReport, URL: srv.URL + "/ar", PageURL: srv.URL}},
+	}
+	results := c.fetchAndParse(context.Background(), co, picks, map[string][]filing{}, &sync.Mutex{})
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	if want := srv.URL + "/real.pdf"; results[0].SourceURL != want {
+		t.Fatalf("source = %s, want %s (the pdf linked on the listing page)", results[0].SourceURL, want)
+	}
+	if len(results[0].PDF) != len(fakePDF()) {
+		t.Fatalf("pdf bytes = %d, want %d", len(results[0].PDF), len(fakePDF()))
+	}
+
+	// A listing page with no documents at all yields no result.
+	picks = map[string][]filing{
+		SegAnnualReport: {{Segment: SegAnnualReport, URL: srv.URL + "/missing", PageURL: srv.URL}},
+	}
+	if results := c.fetchAndParse(context.Background(), co, picks, map[string][]filing{}, &sync.Mutex{}); len(results) != 0 {
+		t.Fatalf("results = %d, want 0", len(results))
+	}
 }
