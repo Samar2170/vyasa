@@ -3,7 +3,6 @@ package ir
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -139,18 +138,12 @@ func (c *Client) llmLinks(ctx context.Context, co models.Company) linkSet {
 	user := fmt.Sprintf(`What are the official website and the investor relations page of the Indian listed company %q (BSE symbol %s)?
 Reply with JSON: {"website": "https://... or null", "investor_relations": "https://... or null"}
 Only give URLs you are confident about. The investor relations page is the section hosting annual reports, investor presentations and quarterly results.`, name, co.Symbol)
-	var raw json.RawMessage
-	err := llm.CompleteJSON(ctx, c.llm, system, user, &raw)
-	if err != nil {
-		log.Printf("[ir] %s: llm link guess failed: %v", co.Symbol, err)
-		return linkSet{}
-	}
 	var out struct {
 		Website           string `json:"website"`
 		InvestorRelations string `json:"investor_relations"`
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		log.Printf("[ir] %s: llm link guess unreadable: %v", co.Symbol, err)
+	if err := c.chatJSON(ctx, system, user, &out); err != nil {
+		log.Printf("[ir] %s: llm link guess failed: %v", co.Symbol, err)
 		return linkSet{}
 	}
 	return linkSet{Website: normalizeURL(out.Website), IR: normalizeURL(out.InvestorRelations)}

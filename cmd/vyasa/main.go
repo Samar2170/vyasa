@@ -26,7 +26,7 @@ import (
 	"vyasa/src/client/tickertapev2"
 	"vyasa/src/config"
 	"vyasa/src/llm"
-	_ "vyasa/src/llm/providers/openrouter"
+	"vyasa/src/llm/providers/openrouter"
 	"vyasa/src/store"
 )
 
@@ -247,7 +247,7 @@ func runIR(ctx context.Context, st *store.Store, storage client.StorageClient, s
 	log.Printf("[ir] %s (%s): %s", co.Symbol, co.Exchange, co.Name)
 
 	model := mustLLM(settings)
-	c := ir.New(storage, st, model)
+	c := ir.New(storage, st, settings.Provider, model)
 	start := time.Now()
 	if err := c.Execute(ctx, *co); err != nil {
 		log.Fatalf("ir: %v", err)
@@ -255,21 +255,23 @@ func runIR(ctx context.Context, st *store.Store, storage client.StorageClient, s
 	log.Printf("[ir] %s: done in %s", co.Symbol, time.Since(start).Round(time.Second))
 }
 
-// mustLLM builds the LLM client from config.json and the provider API key
-// secret (e.g. OPENROUTER_API_KEY for the default openrouter provider).
-func mustLLM(settings config.Settings) llm.ModelClient {
+// mustLLM builds the LLM configuration from config.json and the provider
+// API key secret (e.g. OPENROUTER_API_KEY for the default openrouter
+// provider). The ir client posts its prompts to the provider's
+// chat-completions endpoint with it.
+func mustLLM(settings config.Settings) llm.Config {
 	apiKey, err := config.RequireSecret(strings.ToUpper(settings.Provider) + "_API_KEY")
 	if err != nil {
 		log.Fatal(err)
 	}
-	model, err := llm.NewClient(settings.Provider, llm.Config{
+	model := settings.Model
+	if model == "" {
+		model = openrouter.DefaultModel
+	}
+	return llm.Config{
 		APIKey:       apiKey,
-		DefaultModel: settings.Model,
+		DefaultModel: model,
 		MaxRetries:   settings.MaxRetries,
 		Timeout:      settings.Timeout(),
-	})
-	if err != nil {
-		log.Fatal(err)
 	}
-	return model
 }

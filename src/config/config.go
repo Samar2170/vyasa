@@ -51,12 +51,18 @@ type Settings struct {
 	// StorageSchema is the PostgreSQL schema the store bootstraps and uses
 	// for all tables. Empty disables bootstrapping (plain public default).
 	StorageSchema string `json:"storage_schema"`
+
+	EmbeddingModel string `json:"embedding_model"`
+	EmbeddingDim   int    `json:"embedding_dim"`
 }
 
 const (
 	DefaultTickertapeMaxRequestsPerDay = 5
 	DefaultStorageParentFolder         = "financial_data"
 	DefaultStorageSchema               = "vyasa"
+
+	DefaultEmbeddingModel = "openai/text-embedding-3-small"
+	DefaultEmbeddingDim   = 1536
 )
 
 // Timeout returns the configured timeout as a duration.
@@ -82,6 +88,12 @@ func (s *Settings) withDefaults() {
 	}
 	if s.StorageSchema == "" {
 		s.StorageSchema = DefaultStorageSchema
+	}
+	if s.EmbeddingModel == "" {
+		s.EmbeddingModel = DefaultEmbeddingModel
+	}
+	if s.EmbeddingDim <= 0 {
+		s.EmbeddingDim = DefaultEmbeddingDim
 	}
 }
 

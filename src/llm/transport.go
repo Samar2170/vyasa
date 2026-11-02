@@ -25,7 +25,7 @@ func (t *Transport) DoJSON(ctx context.Context, method, url string, headers map[
 		return err
 	}
 	retries := t.cfg.retries()
-	for attempt := 0; attempt < retries; attempt++ {
+	for attempt := 0; attempt <= retries; attempt++ {
 		resp, err := t.roundTrip(ctx, method, url, headers, body)
 		if err != nil {
 			if attempt < retries && ctx.Err() == nil {

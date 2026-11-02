@@ -3,7 +3,6 @@ package ir
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -804,15 +803,9 @@ Links:
 %s
 
 Reply with JSON mapping each segment to the chosen index or null, e.g. {"annual_report": 3, "investor_presentation": null, "earnings_call_transcript": null, "quarterly_financials": 7}. Only use indexes from the list. Prefer the most recent document.`, name, co.Symbol, segDesc, b.String())
-	var raw json.RawMessage
-	err := llm.CompleteJSON(ctx, c.llm, system, user, &raw)
-	if err != nil {
-		log.Printf("[ir] %s: llm classification failed: %v", co.Symbol, err)
-		return picks
-	}
 	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		log.Printf("[ir] %s: llm classification unreadable: %v", co.Symbol, err)
+	if err := c.chatJSON(ctx, system, user, &out); err != nil {
+		log.Printf("[ir] %s: llm classification failed: %v", co.Symbol, err)
 		return picks
 	}
 

@@ -13,7 +13,8 @@ import (
 
 const (
 	defaultBaseURL = "https://openrouter.ai/api/v1"
-	defaultModel   = "z-ai/glm-5.3-flash"
+	// DefaultModel is the model used when the config sets none.
+	DefaultModel = "z-ai/glm-5.3-flash"
 )
 
 type Config struct {
@@ -49,7 +50,7 @@ func New(cfg Config) (*Client, error) {
 	}
 	model := cfg.DefaultModel
 	if model == "" {
-		model = defaultModel
+		model = DefaultModel
 	}
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("openrouter: API key is required")

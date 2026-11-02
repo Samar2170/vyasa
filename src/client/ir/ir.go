@@ -66,17 +66,17 @@ var segmentOrder = []string{SegAnnualReport, SegPresentation, SegTranscript, Seg
 type Client struct {
 	storage client.StorageClient
 	store   *store.Store
-	llm     llm.ModelClient
+	llm     *llmChat
 	hc      *http.Client
 }
 
-// New creates the client. The llm agent may be nil; discovery then relies on
-// stored links and keyword matching only.
-func New(storage client.StorageClient, st *store.Store, model llm.ModelClient) *Client {
+// New creates the client. When cfg carries no API key the LLM chat handle is
+// nil and discovery relies on stored links and keyword matching only.
+func New(storage client.StorageClient, st *store.Store, provider string, cfg llm.Config) *Client {
 	return &Client{
 		storage: storage,
 		store:   st,
-		llm:     model,
+		llm:     newLLMChat(provider, cfg),
 		hc:      &http.Client{Timeout: httpTimeout},
 	}
 }
