@@ -3,5 +3,8 @@
   "model": "z-ai/glm-5.3-flash",
   "tickertape_max_requests_per_day": 5,
   "storage_parent_folder": "financial_data",
-  "storage_schema": "vyasa"
+  "storage_schema": "vyasa",
+  "embeding_model": "openai/text-embedding-3-small",
+  "embedding_dim": 1536
 }
+

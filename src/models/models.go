@@ -11,7 +11,9 @@ const (
 	TableCompanyLinks     = "company_links"
 	TableCompanyResources = "company_research_resources"
 	TableSavedFiles       = "saved_files"
-	TableDocumentChunks   = "document_chunks"
+
+	TableDocumentChunks = "document_chunks"
+	TableRAGChunks      = "rag_chunks"
 )
 
 // BaseModel carries the columns shared by every table.
@@ -74,4 +76,29 @@ type DocumentChunk struct {
 	Ordinal   int    `json:"ordinal"`
 	Offset    int    `json:"offset"`
 	Text      string `json:"text"`
+}
+
+type RAGChunk struct {
+	BaseModel
+	CompanyID   string    `json:"company_id"`
+	Symbol      string    `json:"symbol"`
+	Segment     string    `json:"segment"`
+	DocumentURL string    `json:"document_url"`
+	Ordinal     int       `json:"ordinal"`
+	Offset      int       `json:"offset"`
+	Section     string    `json:"section,omitempty"`
+	Text        string    `json:"text"`
+	Model       string    `json:"model"`
+	Embedding   []float32 `json:"embedding"`
+
+	Period string `json:"period,omitempty"`
+	// Source is the original source of the document, e.g. "tickertape" or
+	// "investor_relations".
+	Source      string `json:"source,omitempty"`
+	IsQuarterly bool   `json:"is_quarterly,omitempty"`
+}
+
+type RAGHit struct {
+	RAGChunk
+	Score float64 `json:"score"`
 }

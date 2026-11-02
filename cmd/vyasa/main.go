@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -27,6 +28,8 @@ import (
 	"vyasa/src/config"
 	"vyasa/src/llm"
 	"vyasa/src/llm/providers/openrouter"
+	"vyasa/src/models"
+	"vyasa/src/rag"
 	"vyasa/src/store"
 )
 
@@ -74,6 +77,20 @@ func main() {
 		}
 		storage := mustArchivus(settings)
 		runIR(ctx, st, storage, settings, *symbol)
+	case "rag-index":
+		storage := mustArchivus(settings)
+		runRAGIndex(ctx, st, storage, settings)
+	case "rag-search":
+		fs := flag.NewFlagSet("rag-search", flag.ExitOnError)
+		symbol := fs.String("symbol", "", "company symbol to search filings for")
+		query := fs.String("query", "", "search query")
+		segment := fs.String("segment", "", "optional segment filter (annual_report, investor_presentation, earnings_call_transcript, quarterly_financials)")
+		k := fs.Int("k", 8, "max hits")
+		_ = fs.Parse(os.Args[2:])
+		if *symbol == "" || *query == "" {
+			log.Fatal("rag-search requires -symbol SYMBOL and -query QUERY")
+		}
+		runRAGSearch(ctx, st, settings, *symbol, *segment, *query, *k)
 	default:
 		usage()
 	}
@@ -101,7 +118,7 @@ func mustStore(ctx context.Context, settings config.Settings) *store.Store {
 	if err != nil {
 		log.Fatal(err)
 	}
-	st, err := store.New(ctx, dsn, settings.StorageSchema)
+	st, err := store.New(ctx, dsn, settings.StorageSchema, store.WithEmbeddingDim(settings.EmbeddingDim))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -247,7 +264,9 @@ func runIR(ctx context.Context, st *store.Store, storage client.StorageClient, s
 	log.Printf("[ir] %s (%s): %s", co.Symbol, co.Exchange, co.Name)
 
 	model := mustLLM(settings)
-	c := ir.New(storage, st, settings.Provider, model)
+	indexer := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+
+	c := ir.New(storage, st, settings.Provider, model, indexer)
 	start := time.Now()
 	if err := c.Execute(ctx, *co); err != nil {
 		log.Fatalf("ir: %v", err)
@@ -273,5 +292,114 @@ func mustLLM(settings config.Settings) llm.Config {
 		DefaultModel: model,
 		MaxRetries:   settings.MaxRetries,
 		Timeout:      settings.Timeout(),
+	}
+}
+
+// mustEmbedder builds the embeddings client from the provider API key and
+// the embedding_model / embedding_dim settings.
+func mustEmbedder(settings config.Settings) *llm.Embedder {
+	apiKey, err := config.RequireSecret(strings.ToUpper(settings.Provider) + "_API_KEY")
+	if err != nil {
+		log.Fatal(err)
+	}
+	return llm.NewEmbedder(llm.Config{
+		APIKey:     apiKey,
+		MaxRetries: settings.MaxRetries,
+		Timeout:    settings.Timeout(),
+	}, settings.EmbeddingModel, settings.EmbeddingDim)
+}
+
+// runRAGIndex indexes every unindexed archived filing: it downloads the
+// parsed text from Archivus, chunks + embeds + stores it, then marks the
+// resource indexed. Repeat until every row is done.
+func runRAGIndex(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings) {
+	arch, ok := storage.(*archivus.ArchivusClient)
+	if !ok {
+		log.Fatal("rag-index: storage client does not support file lookup")
+	}
+	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+
+	pending, err := st.UnindexedResources(ctx)
+	if err != nil {
+		log.Fatalf("rag-index: %v", err)
+	}
+	if len(pending) == 0 {
+		log.Printf("[rag-index] every archived filing is indexed")
+		return
+	}
+
+	var failed int
+	for _, p := range pending {
+		start := time.Now()
+		text, err := downloadArchivedText(arch, settings.StorageParentFolder, p.TextPath)
+		if err != nil {
+			log.Printf("[rag-index] %s: %s: fetch %s: %v", p.Symbol, p.AnalysisSegment, p.TextPath, err)
+			failed++
+			continue
+		}
+		co := models.Company{BaseModel: models.BaseModel{ID: p.CompanyID}, Symbol: p.Symbol}
+		n, err := ix.IndexDocument(ctx, co, p.AnalysisSegment, p.DocumentURL, text)
+		if err != nil {
+			log.Printf("[rag-index] %s: %s: FAILED: %v", p.Symbol, p.AnalysisSegment, err)
+			failed++
+			continue
+		}
+		if err := st.MarkResourceIndexed(ctx, p.CompanyID, p.AnalysisSegment, true); err != nil {
+			log.Printf("[rag-index] %s: %s: mark indexed: %v", p.Symbol, p.AnalysisSegment, err)
+			failed++
+			continue
+		}
+		log.Printf("[rag-index] %s: %s: indexed %d chunks in %s",
+			p.Symbol, p.AnalysisSegment, n, time.Since(start).Round(time.Second))
+	}
+	log.Printf("[rag-index] %d resources: %d ok, %d failed", len(pending), len(pending)-failed, failed)
+}
+
+// downloadArchivedText fetches a parsed filing text from Archivus. Stored
+// paths are absolute under the parent folder; LookupFile resolves against
+// the parent, so the prefix is stripped first.
+func downloadArchivedText(arch *archivus.ArchivusClient, parentFolder, textPath string) (string, error) {
+	rel := strings.TrimPrefix(textPath, parentFolder+"/")
+	dir, name := path.Split(rel)
+	info, err := arch.LookupFile(dir, name)
+	if err != nil {
+		return "", err
+	}
+	if info == nil {
+		return "", fmt.Errorf("archivus: %s not found", textPath)
+	}
+	data, _, err := arch.DownloadFile(info.ID)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// runRAGSearch runs a hybrid search over one company's indexed filings and
+// prints the ranked chunks.
+func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings, symbol, segment, query string, k int) {
+	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+	co, err := st.GetCompany(ctx, symbol)
+	if err != nil {
+		log.Fatalf("rag-search: %v", err)
+	}
+	if co == nil {
+		log.Fatalf("rag-search: symbol %q not seeded (run: vyasa seed)", symbol)
+	}
+	hits, err := ix.Search(ctx, co.ID, segment, query, k)
+	if err != nil {
+		log.Fatalf("rag-search: %v", err)
+	}
+	if len(hits) == 0 {
+		fmt.Println("no matching passages")
+		return
+	}
+	for i, h := range hits {
+		section := ""
+		if h.Section != "" {
+			section = " — " + h.Section
+		}
+		fmt.Printf("[%d] score %.4f — %s %s%s\n%s\nsource: %s\n\n",
+			i+1, h.Score, h.Symbol, h.Segment, section, h.Text, h.DocumentURL)
 	}
 }
