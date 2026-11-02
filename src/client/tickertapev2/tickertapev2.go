@@ -257,7 +257,7 @@ func (c *Client) parseAndSave(ctx context.Context, co models.Company) (json.RawM
 	if err != nil {
 		return nil, err
 	}
-	if err := c.SaveToFileCollection(ctx, co, raw, nil); err != nil {
+	if _, err := tickertape.SaveSectionsIfChanged(ctx, c.store, co, raw); err != nil {
 		return nil, err
 	}
 	return raw, nil
@@ -300,13 +300,12 @@ func (c *Client) monthResponse(ctx context.Context, co models.Company) (json.Raw
 	return json.RawMessage(raw), nil
 }
 
-// SaveToFileCollection upserts the full extract and each section into the same
-// tables as the v1 client (see tickertape.SaveSections).
+// SaveToFileCollection upserts the full extract and each section into the
+// same tables as the v1 client, unless the extract is unchanged (see
+// tickertape.SaveSectionsIfChanged).
 func (c *Client) SaveToFileCollection(ctx context.Context, co models.Company, raw []byte, _ json.RawMessage) error {
-	if c.store == nil {
-		return fmt.Errorf("tickertapev2: store not configured")
-	}
-	return tickertape.SaveSections(ctx, c.store, co, raw)
+	_, err := tickertape.SaveSectionsIfChanged(ctx, c.store, co, raw)
+	return err
 }
 
 // SaveToFile uploads the raw extract to storage and records its location.
@@ -324,14 +323,19 @@ func (c *Client) SaveToFile(ctx context.Context, co models.Company, raw []byte, 
 }
 
 // Execute scrapes the live page and persists the extract to the database and
-// file storage. It returns ErrDailyLimit once the daily fetch budget is spent.
+// file storage when it changed. It returns ErrDailyLimit once the daily fetch
+// budget is spent.
 func (c *Client) Execute(ctx context.Context, co models.Company) error {
 	raw, err := c.parse(ctx, co)
 	if err != nil {
 		return err
 	}
-	if err := c.SaveToFileCollection(ctx, co, raw, nil); err != nil {
+	saved, err := tickertape.SaveSectionsIfChanged(ctx, c.store, co, raw)
+	if err != nil {
 		return err
+	}
+	if !saved {
+		return nil
 	}
 	return c.SaveToFile(ctx, co, raw, nil)
 }

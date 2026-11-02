@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -120,7 +121,7 @@ func (c *Client) fetchAndSave(ctx context.Context, co models.Company, args json.
 	if err != nil {
 		return nil, err
 	}
-	if err := c.SaveToFileCollection(ctx, co, raw, args); err != nil {
+	if _, err := c.saveResponse(ctx, co, raw); err != nil {
 		return nil, err
 	}
 	return raw, nil
@@ -163,14 +164,41 @@ func (c *Client) monthResponse(ctx context.Context, co models.Company) (json.Raw
 	return json.RawMessage(raw), nil
 }
 
-// SaveToFileCollection stores the raw response in the indiasm table.
-func (c *Client) SaveToFileCollection(ctx context.Context, co models.Company, raw []byte, _ json.RawMessage) error {
-	if c.store == nil {
-		return fmt.Errorf("indiasm: store not configured")
+// latestResponse returns the most recently stored response for the company,
+// regardless of date, for change detection.
+func (c *Client) latestResponse(ctx context.Context, co models.Company) (json.RawMessage, bool, error) {
+	var raw []byte
+	err := c.store.Pool.QueryRow(ctx,
+		`SELECT response FROM indiasm_stock WHERE company_id = $1 ORDER BY date DESC LIMIT 1`,
+		co.ID,
+	).Scan(&raw)
+	if store.IsNotFound(err) {
+		return nil, false, nil
 	}
+	if err != nil {
+		return nil, false, fmt.Errorf("indiasm: read %s latest response: %w", co.Symbol, err)
+	}
+	return json.RawMessage(raw), true, nil
+}
+
+// saveResponse stores the raw response when it differs from the most recent
+// stored one, and reports whether it was saved. Re-running collection with
+// unchanged data is a no-op.
+func (c *Client) saveResponse(ctx context.Context, co models.Company, raw []byte) (bool, error) {
+	if c.store == nil {
+		return false, fmt.Errorf("indiasm: store not configured")
+	}
+
+	if latest, ok, err := c.latestResponse(ctx, co); err != nil {
+		return false, err
+	} else if ok && client.JSONEqual(latest, raw) {
+		log.Printf("[indiasm] %s: response unchanged, skipping save", co.Symbol)
+		return false, nil
+	}
+
 	var response map[string]any
 	if err := json.Unmarshal(raw, &response); err != nil {
-		return fmt.Errorf("indiasm: decode response: %w", err)
+		return false, fmt.Errorf("indiasm: decode response: %w", err)
 	}
 
 	now := time.Now()
@@ -180,9 +208,16 @@ func (c *Client) SaveToFileCollection(ctx context.Context, co models.Company, ra
 		co.ID, co.Symbol, now, response, now,
 	)
 	if err != nil {
-		return fmt.Errorf("indiasm: save response: %w", err)
+		return false, fmt.Errorf("indiasm: save response: %w", err)
 	}
-	return nil
+	return true, nil
+}
+
+// SaveToFileCollection stores the raw response in the indiasm table unless
+// it is unchanged.
+func (c *Client) SaveToFileCollection(ctx context.Context, co models.Company, raw []byte, _ json.RawMessage) error {
+	_, err := c.saveResponse(ctx, co, raw)
+	return err
 }
 
 // SaveToDB stores the raw API response in the indiasm stock table,
@@ -219,14 +254,18 @@ func (c *Client) SaveToFile(ctx context.Context, co models.Company, raw []byte, 
 }
 
 // Execute fetches the stock profile and persists it to the database and
-// file storage.
+// file storage when it changed.
 func (c *Client) Execute(ctx context.Context, co models.Company) error {
 	raw, err := c.fetch(ctx, co)
 	if err != nil {
 		return err
 	}
-	if err := c.SaveToFileCollection(ctx, co, raw, nil); err != nil {
+	saved, err := c.saveResponse(ctx, co, raw)
+	if err != nil {
 		return err
+	}
+	if !saved {
+		return nil
 	}
 	return c.SaveToFile(ctx, co, raw, nil)
 }

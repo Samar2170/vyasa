@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,10 +34,12 @@ const (
 	fileTimeFormat = "2006-01-02"
 )
 
-// responseKey is the top-level key a successful payload must contain.
+// validFunctions maps each supported API function to its response's top-level
+// payload key (the check a successful response must pass) and the table the
+// response is stored in.
 var validFunctions = map[string][2]string{
-	FunctionTimeSeriesDaily: {FunctionTimeSeriesDaily, models.TableAVTimeSeries},
-	FunctionGlobalQuote:     {FunctionGlobalQuote, models.TableAVGlobalQuote},
+	FunctionTimeSeriesDaily: {"Time Series (Daily)", models.TableAVTimeSeries},
+	FunctionGlobalQuote:     {"Global Quote", models.TableAVGlobalQuote},
 }
 
 type Client struct {
@@ -121,8 +126,19 @@ func (c *Client) fetch(ctx context.Context, co models.Company, args json.RawMess
 		}
 	}
 	if key, ok := validFunctions[function]; ok {
-		if _, ok := payload[key[0]]; !ok {
-			return nil, fmt.Errorf("av: %s %s: response missing %q", function, co.Symbol, key[0])
+		raw, ok := payload[key[0]]
+		if !ok {
+			keys := make([]string, 0, len(payload))
+			for k := range payload {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			return nil, fmt.Errorf("av: %s %s: response missing %q (got keys: %s)", function, co.Symbol, key[0], strings.Join(keys, ", "))
+		}
+		// Unknown symbols come back with the key present but empty
+		// ({"Global Quote": {}}): treat that as a failed lookup.
+		if trimmed := strings.TrimSpace(string(raw)); trimmed == "{}" {
+			return nil, fmt.Errorf("av: %s %s: empty %q (unknown symbol?)", function, co.Symbol, key[0])
 		}
 	}
 
@@ -134,7 +150,7 @@ func (c *Client) fetchAndSave(ctx context.Context, function string, co models.Co
 	if err != nil {
 		return nil, err
 	}
-	if err := c.SaveToFileCollection(ctx, co, raw, args); err != nil {
+	if _, err := c.saveResponse(ctx, co, raw, function); err != nil {
 		return nil, err
 	}
 	return raw, nil
@@ -192,36 +208,70 @@ func (c *Client) monthResponse(ctx context.Context, co models.Company, function 
 	return json.RawMessage(raw), nil
 }
 
-// SaveToFileCollection stores the raw response in the table mapped to the
-// requested function (see validFunctions).
-func (c *Client) SaveToFileCollection(ctx context.Context, co models.Company, raw []byte, args json.RawMessage) error {
-	if c.store == nil {
-		return fmt.Errorf("av: store not configured")
+// latestResponse returns the most recently stored response for the company
+// and function, regardless of date, for change detection.
+func (c *Client) latestResponse(ctx context.Context, co models.Company, function string) (json.RawMessage, bool, error) {
+	table := validFunctions[function][1]
+
+	var raw []byte
+	err := c.store.Pool.QueryRow(ctx,
+		fmt.Sprintf(`SELECT response FROM %s WHERE company_id = $1 AND function = $2 ORDER BY date DESC LIMIT 1`, table),
+		co.ID, function,
+	).Scan(&raw)
+	if store.IsNotFound(err) {
+		return nil, false, nil
 	}
-	function, err := c.decodeArguments(args)
 	if err != nil {
-		return err
+		return nil, false, fmt.Errorf("av: read %s latest response: %w", co.Symbol, err)
+	}
+	return json.RawMessage(raw), true, nil
+}
+
+// saveResponse stores the raw response when it differs from the most recent
+// stored one, and reports whether it was saved. Re-running collection with
+// unchanged data is a no-op.
+func (c *Client) saveResponse(ctx context.Context, co models.Company, raw []byte, function string) (bool, error) {
+	if c.store == nil {
+		return false, fmt.Errorf("av: store not configured")
 	}
 	fn, ok := validFunctions[function]
 	if !ok {
-		return fmt.Errorf("av: unsupported function %q", function)
+		return false, fmt.Errorf("av: unsupported function %q", function)
+	}
+
+	if latest, ok, err := c.latestResponse(ctx, co, function); err != nil {
+		return false, err
+	} else if ok && client.JSONEqual(latest, raw) {
+		log.Printf("[av] %s: %s: response unchanged, skipping save", co.Symbol, function)
+		return false, nil
 	}
 
 	var response map[string]any
 	if err := json.Unmarshal(raw, &response); err != nil {
-		return fmt.Errorf("av: decode response: %w", err)
+		return false, fmt.Errorf("av: decode response: %w", err)
 	}
 
 	now := time.Now()
-	_, err = c.store.Pool.Exec(ctx,
+	_, err := c.store.Pool.Exec(ctx,
 		fmt.Sprintf(`INSERT INTO %s (company_id, symbol, function, date, response, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $6)`, fn[1]),
 		co.ID, co.Symbol, function, now, response, now,
 	)
 	if err != nil {
-		return fmt.Errorf("av: save response: %w", err)
+		return false, fmt.Errorf("av: save response: %w", err)
 	}
-	return nil
+	return true, nil
+}
+
+// SaveToFileCollection stores the raw response in the table mapped to the
+// requested function (see validFunctions) unless it is unchanged.
+func (c *Client) SaveToFileCollection(ctx context.Context, co models.Company, raw []byte, args json.RawMessage) error {
+	function, err := c.decodeArguments(args)
+	if err != nil {
+		return err
+	}
+	_, err = c.saveResponse(ctx, co, raw, function)
+	return err
 }
 
 // SaveToDB stores the raw API response in the table mapped to the requested
@@ -270,7 +320,7 @@ func (c *Client) SaveToFile(ctx context.Context, co models.Company, raw []byte, 
 }
 
 // Execute fetches data for every supported function and persists each
-// response to the database and file storage.
+// response to the database and file storage when it changed.
 func (c *Client) Execute(ctx context.Context, co models.Company) error {
 	for function := range validFunctions {
 		args, err := json.Marshal(map[string]string{"function": function})
@@ -281,8 +331,12 @@ func (c *Client) Execute(ctx context.Context, co models.Company) error {
 		if err != nil {
 			return err
 		}
-		if err := c.SaveToFileCollection(ctx, co, raw, args); err != nil {
+		saved, err := c.saveResponse(ctx, co, raw, function)
+		if err != nil {
 			return err
+		}
+		if !saved {
+			continue
 		}
 		if err := c.SaveToFile(ctx, co, raw, args); err != nil {
 			return err

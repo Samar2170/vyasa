@@ -2,7 +2,7 @@
 // (config.json), PostgreSQL and Archivus storage into the subcommands:
 //
 //	vyasa seed [-file EQUITY_L.csv]
-//	vyasa collect -symbol RELIANCE [-source indiasm,tickertape,av]
+//	vyasa collect -symbol RELIANCE [-source indiasm,tickertapev2,av]
 package main
 
 import (
@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"vyasa/internal/equity"
@@ -19,8 +21,12 @@ import (
 	"vyasa/src/client/archivus"
 	"vyasa/src/client/av"
 	"vyasa/src/client/indiasm"
+	"vyasa/src/client/ir"
+	"vyasa/src/client/tickertape"
 	"vyasa/src/client/tickertapev2"
 	"vyasa/src/config"
+	"vyasa/src/llm"
+	_ "vyasa/src/llm/providers/openrouter"
 	"vyasa/src/store"
 )
 
@@ -52,13 +58,22 @@ func main() {
 	case "collect":
 		fs := flag.NewFlagSet("collect", flag.ExitOnError)
 		symbol := fs.String("symbol", "", "company symbol to collect data for")
-		sources := fs.String("source", "indiasm,tickertapev2,av", "comma-separated data sources")
+		sources := fs.String("source", "indiasm,tickertapev2,av", "comma-separated data sources (tickertapev2 falls back to saved pages)")
 		_ = fs.Parse(os.Args[2:])
 		if *symbol == "" {
 			log.Fatal("collect requires -symbol SYMBOL")
 		}
 		storage := mustArchivus(settings)
 		runCollect(ctx, st, storage, settings, *symbol, parseSources(*sources))
+	case "ir":
+		fs := flag.NewFlagSet("ir", flag.ExitOnError)
+		symbol := fs.String("symbol", "", "company symbol to collect IR filings for")
+		_ = fs.Parse(os.Args[2:])
+		if *symbol == "" {
+			log.Fatal("ir requires -symbol SYMBOL")
+		}
+		storage := mustArchivus(settings)
+		runIR(ctx, st, storage, settings, *symbol)
 	default:
 		usage()
 	}
@@ -70,8 +85,11 @@ func usage() {
 commands:
   seed      load EQUITY_L.csv companies into PostgreSQL (-file, default EQUITY_L.csv)
   collect   fetch data for one company: -symbol RELIANCE
-            -source indiasm,tickertape,av (tickertape reads saved pages from
-            tickertape_files/, use tickertapev2 for live scraping)`)
+            -source indiasm,tickertapev2,av (tickertapev2 scrapes live pages,
+            capped per day by config.json; when it fails it falls back to
+            saved pages in tickertape_files/)
+  ir        fetch and archive investor-relations filings (annual report,
+            presentation, transcript, quarterly financials): -symbol RELIANCE`)
 	os.Exit(2)
 }
 
@@ -120,8 +138,10 @@ func runSeed(ctx context.Context, st *store.Store, file string) {
 }
 
 // runCollect resolves the company and fetches data from every requested
-// source sequentially (av rate-limits itself; the others are cheap).
-func runCollect(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings, symbol string, sources []string) {
+// source concurrently: each source runs in its own goroutine, so one
+// source's failure (or slow rate limiting) never blocks or breaks another.
+// It returns the number of failed sources.
+func runCollect(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings, symbol string, sources []string) int {
 	co, err := st.GetCompany(ctx, symbol)
 	if err != nil {
 		log.Fatalf("collect: %v", err)
@@ -131,35 +151,69 @@ func runCollect(ctx context.Context, st *store.Store, storage client.StorageClie
 	}
 	log.Printf("[collect] %s (%s): %s", co.Symbol, co.Exchange, co.Name)
 
+	srcs, fallbacks := dataSources(st, storage, settings)
 	for _, name := range sources {
-		src, ok := dataSources(st, storage, settings)[name]
-		if !ok {
-			log.Fatalf("collect: unknown source %q (want: indiasm, tickertape, tickertapev2, av)", name)
+		if _, ok := srcs[name]; !ok {
+			log.Fatalf("collect: unknown source %q (want: indiasm, tickertapev2, av)", name)
 		}
-		start := time.Now()
-		if err := src.Execute(ctx, *co); err != nil {
-			log.Printf("[collect] %s: FAILED: %v", name, err)
-			continue
-		}
-		log.Printf("[collect] %s: done in %s", name, time.Since(start).Round(time.Second))
 	}
+
+	var mu sync.Mutex
+	failed := make([]string, 0, len(sources))
+	var wg sync.WaitGroup
+	for _, name := range sources {
+		src := srcs[name]
+		wg.Add(1)
+		go func(name string, src client.DataSourceClient) {
+			defer wg.Done()
+
+			start := time.Now()
+			if err := src.Execute(ctx, *co); err != nil {
+				if fb, ok := fallbacks[name]; ok {
+					log.Printf("[collect] %s: %v — falling back to saved pages", name, err)
+					if ferr := fb.Execute(ctx, *co); ferr != nil {
+						log.Printf("[collect] %s fallback: FAILED: %v", name, ferr)
+						mu.Lock()
+						failed = append(failed, name)
+						mu.Unlock()
+						return
+					}
+					log.Printf("[collect] %s fallback: done in %s", name, time.Since(start).Round(time.Second))
+					return
+				}
+				log.Printf("[collect] %s: FAILED: %v", name, err)
+				mu.Lock()
+				failed = append(failed, name)
+				mu.Unlock()
+				return
+			}
+			log.Printf("[collect] %s: done in %s", name, time.Since(start).Round(time.Second))
+		}(name, src)
+	}
+	wg.Wait()
+
+	sort.Strings(failed)
+	log.Printf("[collect] %d sources: %d ok, %d failed", len(sources), len(sources)-len(failed), len(failed))
+	return len(failed)
 }
 
-// dataSources builds the requested clients. tickertape reads saved pages
-// from tickertape_files/; tickertapev2 scrapes live pages with the daily cap
-// from config.json.
-func dataSources(st *store.Store, storage client.StorageClient, settings config.Settings) map[string]client.DataSourceClient {
-	sources := make(map[string]client.DataSourceClient, 4)
+// dataSources builds the requested clients. tickertapev2 scrapes live pages
+// with the daily cap from config.json; when it fails (cap reached, scrape
+// error) it falls back to the file-based tickertape client reading saved
+// pages from tickertape_files/.
+func dataSources(st *store.Store, storage client.StorageClient, settings config.Settings) (sources, fallbacks map[string]client.DataSourceClient) {
+	sources = make(map[string]client.DataSourceClient, 3)
+	fallbacks = make(map[string]client.DataSourceClient, 1)
 
 	if primary := config.Secret("INDIAN_SM_API_KEY"); primary != "" || config.Secret("INDIAN_SM_API_KEY2") != "" {
 		sources["indiasm"] = indiasm.New(primary, config.Secret("INDIAN_SM_API_KEY2"), storage, st)
 	}
-	// sources["tickertape"] = tickertape.New(storage, st)
 	sources["tickertapev2"] = tickertapev2.New(settings.TickertapeMaxRequestsPerDay, storage, st)
+	fallbacks["tickertapev2"] = tickertape.New(storage, st)
 	if key := config.Secret("ALPHAVANTAGE_API_KEY"); key != "" {
 		sources["av"] = av.New(key, storage, st)
 	}
-	return sources
+	return sources, fallbacks
 }
 
 // parseSources splits the -source list, lower-cases it and dedupes it.
@@ -175,4 +229,45 @@ func parseSources(list string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// runIR fetches and archives the latest investor-relations filings for one
+// company: the annual report, investor presentation, earnings call transcript
+// and latest quarterly financials.
+func runIR(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings, symbol string) {
+	co, err := st.GetCompany(ctx, symbol)
+	if err != nil {
+		log.Fatalf("ir: %v", err)
+	}
+	if co == nil {
+		log.Fatalf("ir: symbol %q not seeded (run: vyasa seed)", symbol)
+	}
+	log.Printf("[ir] %s (%s): %s", co.Symbol, co.Exchange, co.Name)
+
+	model := mustLLM(settings)
+	c := ir.New(storage, st, model)
+	start := time.Now()
+	if err := c.Execute(ctx, *co); err != nil {
+		log.Fatalf("ir: %v", err)
+	}
+	log.Printf("[ir] %s: done in %s", co.Symbol, time.Since(start).Round(time.Second))
+}
+
+// mustLLM builds the LLM client from config.json and the provider API key
+// secret (e.g. OPENROUTER_API_KEY for the default openrouter provider).
+func mustLLM(settings config.Settings) llm.ModelClient {
+	apiKey, err := config.RequireSecret(strings.ToUpper(settings.Provider) + "_API_KEY")
+	if err != nil {
+		log.Fatal(err)
+	}
+	model, err := llm.NewClient(settings.Provider, llm.Config{
+		APIKey:       apiKey,
+		DefaultModel: settings.Model,
+		MaxRetries:   settings.MaxRetries,
+		Timeout:      settings.Timeout(),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	return model
 }

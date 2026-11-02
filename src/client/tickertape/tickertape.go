@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -200,7 +201,7 @@ func (c *Client) parseAndSave(ctx context.Context, co models.Company) (json.RawM
 	if err != nil {
 		return nil, err
 	}
-	if err := c.SaveToFileCollection(ctx, co, raw, nil); err != nil {
+	if _, err := SaveSectionsIfChanged(ctx, c.store, co, raw); err != nil {
 		return nil, err
 	}
 	return raw, nil
@@ -243,13 +244,45 @@ func (c *Client) monthResponse(ctx context.Context, co models.Company) (json.Raw
 	return json.RawMessage(raw), nil
 }
 
-// SaveToFileCollection upserts the full extract into the tickertape
-// table and each section into its own table (see SaveSections).
+// SaveToFileCollection upserts the full extract into the tickertape table
+// and each section into its own table (see SaveSectionsIfChanged).
 func (c *Client) SaveToFileCollection(ctx context.Context, co models.Company, raw []byte, _ json.RawMessage) error {
-	if c.store == nil {
-		return fmt.Errorf("tickertape: store not configured")
+	_, err := SaveSectionsIfChanged(ctx, c.store, co, raw)
+	return err
+}
+
+// latestExtract returns the most recently stored full extract for the
+// company's symbol, regardless of date, for change detection.
+func latestExtract(ctx context.Context, s *store.Store, co models.Company) (json.RawMessage, bool, error) {
+	var raw []byte
+	err := s.Pool.QueryRow(ctx,
+		`SELECT response FROM tickertape WHERE symbol = $1 ORDER BY date DESC LIMIT 1`,
+		co.Symbol,
+	).Scan(&raw)
+	if store.IsNotFound(err) {
+		return nil, false, nil
 	}
-	return SaveSections(ctx, c.store, co, raw)
+	if err != nil {
+		return nil, false, fmt.Errorf("tickertape: read %s latest extract: %w", co.Symbol, err)
+	}
+	return json.RawMessage(raw), true, nil
+}
+
+// SaveSectionsIfChanged upserts the extract and its sections when the
+// extract differs from the most recently stored one, and reports whether it
+// was saved. Re-running collection with unchanged data is a no-op.
+func SaveSectionsIfChanged(ctx context.Context, s *store.Store, co models.Company, raw []byte) (bool, error) {
+	if s == nil {
+		return false, fmt.Errorf("tickertape: store not configured")
+	}
+
+	if latest, ok, err := latestExtract(ctx, s, co); err != nil {
+		return false, err
+	} else if ok && client.JSONEqual(latest, raw) {
+		log.Printf("[tickertape] %s: extract unchanged, skipping save", co.Symbol)
+		return false, nil
+	}
+	return true, SaveSections(ctx, s, co, raw)
 }
 
 // SaveSections upserts the full extract into the tickertape table and
@@ -271,9 +304,7 @@ func SaveSections(ctx context.Context, s *store.Store, co models.Company, raw []
 	if err != nil {
 		return fmt.Errorf("tickertape: %s: %w", co.Symbol, err)
 	}
-	if err := upsertDoc(ctx, s.Pool, models.TableTickertape,
-		co, "", day, full, now,
-	); err != nil {
+	if err := upsertExtract(ctx, s.Pool, co, day, full, now); err != nil {
 		return fmt.Errorf("tickertape: save extract: %w", err)
 	}
 
@@ -286,7 +317,7 @@ func SaveSections(ctx context.Context, s *store.Store, co models.Company, raw []
 		if err != nil {
 			return fmt.Errorf("tickertape: %s: decode %s: %w", co.Symbol, key, err)
 		}
-		if err := upsertDoc(ctx, s.Pool, SectionTables[key],
+		if err := upsertSection(ctx, s.Pool, SectionTables[key],
 			co, key, day, value, now,
 		); err != nil {
 			return fmt.Errorf("tickertape: %s: save %s: %w", co.Symbol, key, err)
@@ -305,8 +336,22 @@ func jsonValue(raw []byte) (any, error) {
 	return v, nil
 }
 
-// upsertDoc writes one (symbol, date) extract or section document.
-func upsertDoc(ctx context.Context, pool *pgxpool.Pool, table string, co models.Company, section string, day time.Time, value any, now time.Time) error {
+// upsertExtract writes the (symbol, date) full-extract document.
+func upsertExtract(ctx context.Context, pool *pgxpool.Pool, co models.Company, day time.Time, value any, now time.Time) error {
+	_, err := pool.Exec(ctx,
+		`INSERT INTO tickertape (company_id, symbol, date, response, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $5)
+			ON CONFLICT (symbol, date) DO UPDATE
+			SET company_id = EXCLUDED.company_id,
+				response = EXCLUDED.response,
+				updated_at = EXCLUDED.updated_at`,
+		co.ID, co.Symbol, day, value, now,
+	)
+	return err
+}
+
+// upsertSection writes one (symbol, date) section document.
+func upsertSection(ctx context.Context, pool *pgxpool.Pool, table string, co models.Company, section string, day time.Time, value any, now time.Time) error {
 	_, err := pool.Exec(ctx, fmt.Sprintf(
 		`INSERT INTO %s (company_id, symbol, section, date, response, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $6)
@@ -336,14 +381,18 @@ func (c *Client) SaveToFile(ctx context.Context, co models.Company, raw []byte, 
 }
 
 // Execute parses the saved tickertape page and persists the extract to the
-// database and file storage.
+// database and file storage when it changed.
 func (c *Client) Execute(ctx context.Context, co models.Company) error {
 	raw, err := c.parse(co)
 	if err != nil {
 		return err
 	}
-	if err := c.SaveToFileCollection(ctx, co, raw, nil); err != nil {
+	saved, err := SaveSectionsIfChanged(ctx, c.store, co, raw)
+	if err != nil {
 		return err
+	}
+	if !saved {
+		return nil
 	}
 	return c.SaveToFile(ctx, co, raw, nil)
 }
