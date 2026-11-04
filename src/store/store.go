@@ -53,7 +53,7 @@ func New(ctx context.Context, dsn, schema string, opts ...Option) (*Store, error
 	if schema != "" {
 		sanitized := pgx.Identifier{schema}.Sanitize()
 		cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-			_, err := conn.Exec(ctx, "SET search_path TO "+sanitized)
+			_, err := conn.Exec(ctx, "SET search_path TO "+sanitized+", public")
 			return err
 		}
 	}
@@ -263,7 +263,6 @@ ALTER TABLE company_research_resources
 `
 
 const ragChunksSchema = `
-CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS rag_chunks (
 	id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -277,6 +276,9 @@ CREATE TABLE IF NOT EXISTS rag_chunks (
 	text text NOT NULL DEFAULT '',
 	embedding vector(%[1]d) NOT NULL,
 	model text NOT NULL DEFAULT '',
+	period text NOT NULL DEFAULT '',
+	source text NOT NULL DEFAULT '',
+	is_quarterly boolean NOT NULL DEFAULT false,
 	tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
 	created_at timestamptz NOT NULL DEFAULT now(),
 	updated_at timestamptz NOT NULL DEFAULT now()
@@ -287,6 +289,10 @@ CREATE INDEX IF NOT EXISTS rag_chunks_vector
 	ON rag_chunks USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS rag_chunks_lexical
 	ON rag_chunks USING gin (tsv);
+
+ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS period text NOT NULL DEFAULT '';
+ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '';
+ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS is_quarterly boolean NOT NULL DEFAULT false;
 `
 
 // Migrate creates the schema if it does not exist yet.

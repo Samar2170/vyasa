@@ -12,6 +12,17 @@ type Embedder interface {
 	Embed(ctx context.Context, texts []string) ([][]float32, error)
 }
 
+// DocMeta describes the source document every chunk of an indexing run
+// belongs to. It is stored beside the chunks so retrieval hits carry their
+// fiscal context.
+type DocMeta struct {
+	Segment     string
+	DocumentURL string
+	Period      string // e.g. "FY2025-26" or "Q1 FY2026-27"; "" when unknown
+	Source      string // provenance, e.g. "investor_relations"
+	IsQuarterly bool
+}
+
 // Indexer chunks documents, embeds the chunks and stores them for hybrid
 // retrieval.
 type Indexer struct {
@@ -29,7 +40,7 @@ func NewIndexer(st *store.Store, emb Embedder, model string, dim int) *Indexer {
 
 // IndexDocument replaces the stored chunks of one (company, segment) with
 // chunks of text, embedded. Indexing is idempotent.
-func (ix *Indexer) IndexDocument(ctx context.Context, co models.Company, segment, documentURL, text string) (int, error) {
+func (ix *Indexer) IndexDocument(ctx context.Context, co models.Company, meta DocMeta, text string) (int, error) {
 	if ix == nil || ix.st == nil {
 		return 0, fmt.Errorf("rag: indexer not configured")
 	}
@@ -37,9 +48,9 @@ func (ix *Indexer) IndexDocument(ctx context.Context, co models.Company, segment
 		return 0, fmt.Errorf("rag: embedder not configured")
 	}
 
-	parts := chunks.ForSegment(segment).Chunk(text)
-	if err := ix.st.DeleteRAGChunks(ctx, co.ID, segment); err != nil {
-		return 0, fmt.Errorf("rag: clear %s/%s: %w", co.Symbol, segment, err)
+	parts := chunks.ForSegment(meta.Segment).Chunk(text)
+	if err := ix.st.DeleteRAGChunks(ctx, co.ID, meta.Segment); err != nil {
+		return 0, fmt.Errorf("rag: clear %s/%s: %w", co.Symbol, meta.Segment, err)
 	}
 	if len(parts) == 0 {
 		return 0, nil
@@ -51,10 +62,10 @@ func (ix *Indexer) IndexDocument(ctx context.Context, co models.Company, segment
 	}
 	vecs, err := ix.emb.Embed(ctx, inputs)
 	if err != nil {
-		return 0, fmt.Errorf("rag: embed %s/%s: %w", co.Symbol, segment, err)
+		return 0, fmt.Errorf("rag: embed %s/%s: %w", co.Symbol, meta.Segment, err)
 	}
 	if len(vecs) != len(parts) {
-		return 0, fmt.Errorf("rag: embed %s/%s: %d vectors for %d chunks", co.Symbol, segment, len(vecs), len(parts))
+		return 0, fmt.Errorf("rag: embed %s/%s: %d vectors for %d chunks", co.Symbol, meta.Segment, len(vecs), len(parts))
 	}
 
 	rows := make([]models.RAGChunk, len(parts))
@@ -62,18 +73,21 @@ func (ix *Indexer) IndexDocument(ctx context.Context, co models.Company, segment
 		rows[i] = models.RAGChunk{
 			CompanyID:   co.ID,
 			Symbol:      co.Symbol,
-			Segment:     segment,
-			DocumentURL: documentURL,
+			Segment:     meta.Segment,
+			DocumentURL: meta.DocumentURL,
 			Ordinal:     p.Ordinal,
 			Offset:      p.Offset,
 			Section:     p.Context,
 			Text:        p.Text,
 			Embedding:   vecs[i],
 			Model:       ix.model,
+			Period:      meta.Period,
+			Source:      meta.Source,
+			IsQuarterly: meta.IsQuarterly,
 		}
 	}
 	if err := ix.st.InsertRAGChunks(ctx, rows); err != nil {
-		return 0, fmt.Errorf("rag: store %s/%s: %w", co.Symbol, segment, err)
+		return 0, fmt.Errorf("rag: store %s/%s: %w", co.Symbol, meta.Segment, err)
 	}
 	return len(rows), nil
 }

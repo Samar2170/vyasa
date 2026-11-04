@@ -17,7 +17,6 @@ import (
 	"sync"
 	"time"
 
-	"vyasa/internal/equity"
 	"vyasa/src/client"
 	"vyasa/src/client/archivus"
 	"vyasa/src/client/av"
@@ -31,6 +30,7 @@ import (
 	"vyasa/src/models"
 	"vyasa/src/rag"
 	"vyasa/src/store"
+	"vyasa/wf/equity"
 )
 
 func main() {
@@ -78,8 +78,11 @@ func main() {
 		storage := mustArchivus(settings)
 		runIR(ctx, st, storage, settings, *symbol)
 	case "rag-index":
+		fs := flag.NewFlagSet("rag-index", flag.ExitOnError)
+		force := fs.Bool("force", false, "re-index every archived filing, even ones already indexed")
+		_ = fs.Parse(os.Args[2:])
 		storage := mustArchivus(settings)
-		runRAGIndex(ctx, st, storage, settings)
+		runRAGIndex(ctx, st, storage, settings, *force)
 	case "rag-search":
 		fs := flag.NewFlagSet("rag-search", flag.ExitOnError)
 		symbol := fs.String("symbol", "", "company symbol to search filings for")
@@ -107,7 +110,11 @@ commands:
             capped per day by config.json; when it fails it falls back to
             saved pages in tickertape_files/)
   ir        fetch and archive investor-relations filings (annual report,
-            presentation, transcript, quarterly financials): -symbol RELIANCE`)
+            presentation, transcript, quarterly financials): -symbol RELIANCE
+  rag-index index archived filings (chunk, embed, store): [-force] re-index
+            even already-indexed investor-relations filings
+  rag-search hybrid semantic+keyword search over indexed filings:
+            -symbol RELIANCE -query "capex guidance" [-segment ...] [-k 8]`)
 	os.Exit(2)
 }
 
@@ -309,15 +316,23 @@ func mustEmbedder(settings config.Settings) *llm.Embedder {
 	}, settings.EmbeddingModel, settings.EmbeddingDim)
 }
 
-// runRAGIndex indexes every unindexed archived filing: it downloads the
-// parsed text from Archivus, chunks + embeds + stores it, then marks the
-// resource indexed. Repeat until every row is done.
-func runRAGIndex(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings) {
+// runRAGIndex indexes archived filings: for every pending resource it
+// re-extracts text from the archived PDF (so chunks get [[page N]] markers
+// and refreshed section detection), chunks + embeds + stores it, uploads the
+// refreshed text back to Archivus and marks the resource indexed. With
+// force, investor-relations resources already indexed are re-processed too.
+func runRAGIndex(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings, force bool) {
 	arch, ok := storage.(*archivus.ArchivusClient)
 	if !ok {
 		log.Fatal("rag-index: storage client does not support file lookup")
 	}
 	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+
+	if force {
+		if err := st.ResetResourcesIndexed(ctx, irSource); err != nil {
+			log.Fatalf("rag-index: %v", err)
+		}
+	}
 
 	pending, err := st.UnindexedResources(ctx)
 	if err != nil {
@@ -331,14 +346,21 @@ func runRAGIndex(ctx context.Context, st *store.Store, storage client.StorageCli
 	var failed int
 	for _, p := range pending {
 		start := time.Now()
-		text, err := downloadArchivedText(arch, settings.StorageParentFolder, p.TextPath)
+		text, err := filingText(arch, settings.StorageParentFolder, p)
 		if err != nil {
-			log.Printf("[rag-index] %s: %s: fetch %s: %v", p.Symbol, p.AnalysisSegment, p.TextPath, err)
+			log.Printf("[rag-index] %s: %s: fetch %s: %v", p.Symbol, p.AnalysisSegment, p.RawDataUrl, err)
 			failed++
 			continue
 		}
 		co := models.Company{BaseModel: models.BaseModel{ID: p.CompanyID}, Symbol: p.Symbol}
-		n, err := ix.IndexDocument(ctx, co, p.AnalysisSegment, p.DocumentURL, text)
+		meta := rag.DocMeta{
+			Segment:     p.AnalysisSegment,
+			DocumentURL: p.DocumentURL,
+			Period:      rag.DerivePeriod(p.AnchorText, p.DocumentURL, rag.TextHead(text, 4000)),
+			Source:      p.Source,
+			IsQuarterly: p.AnalysisSegment == "quarterly_financials",
+		}
+		n, err := ix.IndexDocument(ctx, co, meta, text)
 		if err != nil {
 			log.Printf("[rag-index] %s: %s: FAILED: %v", p.Symbol, p.AnalysisSegment, err)
 			failed++
@@ -349,30 +371,90 @@ func runRAGIndex(ctx context.Context, st *store.Store, storage client.StorageCli
 			failed++
 			continue
 		}
-		log.Printf("[rag-index] %s: %s: indexed %d chunks in %s",
-			p.Symbol, p.AnalysisSegment, n, time.Since(start).Round(time.Second))
+		log.Printf("[rag-index] %s: %s: indexed %d chunks (period %s) in %s",
+			p.Symbol, p.AnalysisSegment, n, orDash(meta.Period), time.Since(start).Round(time.Second))
 	}
 	log.Printf("[rag-index] %d resources: %d ok, %d failed", len(pending), len(pending)-failed, failed)
 }
 
-// downloadArchivedText fetches a parsed filing text from Archivus. Stored
-// paths are absolute under the parent folder; LookupFile resolves against
-// the parent, so the prefix is stripped first.
-func downloadArchivedText(arch *archivus.ArchivusClient, parentFolder, textPath string) (string, error) {
-	rel := strings.TrimPrefix(textPath, parentFolder+"/")
-	dir, name := path.Split(rel)
-	info, err := arch.LookupFile(dir, name)
-	if err != nil {
-		return "", err
+const irSource = "investor_relations"
+
+// filingText fetches the parsed text of an archived filing. The archived PDF
+// is preferred and re-extracted so the text carries [[page N]] markers; the
+// stored text file is the fallback for unreadable PDFs. A successful PDF
+// re-extract is uploaded back to the same location so the archive stays
+// consistent with what was indexed.
+func filingText(arch *archivus.ArchivusClient, parentFolder string, p store.PendingResource) (string, error) {
+	if p.RawDataUrl != "" {
+		data, err := downloadArchivedFile(arch, parentFolder, p.RawDataUrl)
+		if err == nil {
+			text, pages := ir.ExtractPDFText(data)
+			if pages > 0 && strings.TrimSpace(text) != "" {
+				if txtName := fileNameOf(p.TextPath); txtName != "" {
+					if _, uerr := arch.UploadFile(folderRel(parentFolder, p.TextPath),
+						[]*archivus.UploadFile{{Name: txtName, Content: []byte(text)}}); uerr != nil {
+						log.Printf("[rag-index] %s: %s: refresh text upload: %v", p.Symbol, p.AnalysisSegment, uerr)
+					}
+				}
+				return text, nil
+			}
+			log.Printf("[rag-index] %s: %s: PDF re-extract empty (%d pages), falling back to stored text",
+				p.Symbol, p.AnalysisSegment, pages)
+		} else {
+			log.Printf("[rag-index] %s: %s: PDF fetch failed (%v), falling back to stored text",
+				p.Symbol, p.AnalysisSegment, err)
+		}
 	}
-	if info == nil {
-		return "", fmt.Errorf("archivus: %s not found", textPath)
-	}
-	data, _, err := arch.DownloadFile(info.ID)
+	data, err := downloadArchivedFile(arch, parentFolder, p.TextPath)
 	if err != nil {
 		return "", err
 	}
 	return string(data), nil
+}
+
+// downloadArchivedFile fetches one archived file from Archivus. Stored paths
+// are absolute under the parent folder; LookupFile resolves against the
+// parent, so the prefix is stripped first.
+func downloadArchivedFile(arch *archivus.ArchivusClient, parentFolder, storedPath string) ([]byte, error) {
+	dir, name := folderRel(parentFolder, storedPath), fileNameOf(storedPath)
+	info, err := arch.LookupFile(dir, name)
+	if err != nil {
+		return nil, err
+	}
+	if info == nil {
+		return nil, fmt.Errorf("archivus: %s not found", storedPath)
+	}
+	data, _, err := arch.DownloadFile(info.ID)
+	return data, err
+}
+
+// folderRel converts a stored absolute-under-parent path to the
+// parent-relative folder LookupFile/UploadFile expect.
+func folderRel(parentFolder, storedPath string) string {
+	return strings.TrimPrefix(folderOf(storedPath), parentFolder+"/")
+}
+
+// fileNameOf returns the file name of a stored path.
+func fileNameOf(storedPath string) string {
+	_, name := path.Split(storedPath)
+	return name
+}
+
+// folderOf splits the directory from a stored path.
+func folderOf(storedPath string) string {
+	i := strings.LastIndexByte(storedPath, '/')
+	if i < 0 {
+		return ""
+	}
+	return storedPath[:i]
+}
+
+// orDash renders empty strings as a dash in logs and output.
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 // runRAGSearch runs a hybrid search over one company's indexed filings and
@@ -395,11 +477,18 @@ func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings
 		return
 	}
 	for i, h := range hits {
+		label := h.Segment
+		if h.Period != "" {
+			label += " " + h.Period
+		}
+		if h.IsQuarterly {
+			label += " [quarterly]"
+		}
 		section := ""
 		if h.Section != "" {
 			section = " — " + h.Section
 		}
 		fmt.Printf("[%d] score %.4f — %s %s%s\n%s\nsource: %s\n\n",
-			i+1, h.Score, h.Symbol, h.Segment, section, h.Text, h.DocumentURL)
+			i+1, h.Score, h.Symbol, label, section, h.Text, h.DocumentURL)
 	}
 }

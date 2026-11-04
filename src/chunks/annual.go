@@ -2,6 +2,7 @@ package chunks
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -13,9 +14,11 @@ const (
 )
 
 // AnnualReportChunker chunks annual reports along their section structure:
-// every detected section heading starts a new chunk, paragraphs are packed
-// up to the target size and each chunk carries its section and page as
-// retrieval context.
+// every detected section heading starts a new chunk and paragraphs are packed
+// up to the target size. Chunks carry only their page number as context —
+// section titles are not recorded, because heading detection on jumbled PDF
+// extraction proved unreliable and a wrong label sticks to hundreds of
+// chunks.
 type AnnualReportChunker struct {
 	// Target is the preferred chunk length in runes; Max the hard cap.
 	Target int
@@ -45,19 +48,12 @@ func (c AnnualReportChunker) Chunk(text string) []Chunk {
 	var out []Chunk
 	var cur []docBlock
 	size := 0
-	section := ""
 
 	context := func(b docBlock) string {
-		switch {
-		case section != "" && b.page > 0:
-			return fmt.Sprintf("%s — page %d", section, b.page)
-		case section != "":
-			return section
-		case b.page > 0:
+		if b.page > 0 {
 			return fmt.Sprintf("page %d", b.page)
-		default:
-			return ""
 		}
+		return ""
 	}
 	flush := func() {
 		if len(cur) == 0 {
@@ -80,9 +76,11 @@ func (c AnnualReportChunker) Chunk(text string) []Chunk {
 	}
 
 	for _, blk := range blocks {
-		if isAnnualHeading(blk.text) {
+		if _, _, ok := splitHeading(blk.text); ok {
+			// the heading line stays part of the chunk text so lexical
+			// search keeps matching on it; it is no longer recorded as the
+			// chunk's section
 			flush()
-			section = headingTitle(blk.text)
 		}
 		n := utf8.RuneCountInString(blk.text)
 		if n > max {
@@ -113,7 +111,7 @@ func (c AnnualReportChunker) Chunk(text string) []Chunk {
 }
 
 // annualHeadings are the standard sections of an Indian annual report,
-// matched case-insensitively against short standalone lines.
+// matched case-insensitively as line prefixes (after stripping numbering).
 var annualHeadings = []string{
 	"board's report", "board’s report",
 	"directors' report", "directors’ report", "directors report",
@@ -124,16 +122,57 @@ var annualHeadings = []string{
 	"financial statements", "notes to the", "annexure",
 	"key managerial", "risk management", "business responsibility",
 	"corporate information", "ten year", "notice",
+	"report of the", "statement of", "financial highlights",
 }
 
-// isAnnualHeading reports whether a paragraph looks like an annual report
-// section heading: a short standalone line that is either shouted in
-// capitals or names a standard report section.
+// headingPrefixRE strips the numbering annual report sections carry
+// ("G13.", "2.1", "IV.", "Annexure I") before keyword matching.
+var headingPrefixRE = regexp.MustCompile(
+	`(?i)^(?:annexure\s*[a-z0-9]*|[ivxlcdm]+\.?|\d+(?:\.\d+)*|[a-z]\d*)[\s.):\-]+`)
+
+// isAnnualHeading reports whether a paragraph opens with a section-heading
+// line.
 func isAnnualHeading(text string) bool {
-	s := strings.TrimSpace(text)
-	if s == "" || strings.Contains(s, "\n") || utf8.RuneCountInString(s) > 80 {
+	first, _, _ := strings.Cut(strings.TrimSpace(text), "\n")
+	return isHeadingLine(first)
+}
+
+// splitHeading separates the leading section-heading line of a paragraph
+// from its body. PDF extraction rarely leaves a blank line under a heading,
+// so "DIRECTORS' REPORT\nThe board presents…" is one paragraph whose first
+// line is the heading.
+func splitHeading(text string) (head, body string, ok bool) {
+	first, rest, _ := strings.Cut(strings.TrimSpace(text), "\n")
+	if !isHeadingLine(first) {
+		return "", "", false
+	}
+	return first, rest, true
+}
+
+// isHeadingLine applies the heading rules to a single line. They are
+// deliberately strict — jumbled PDF text glues page furniture to titles,
+// and a wrong heading sticks to hundreds of chunks, so an unsectioned chunk
+// is always preferred over a mis-sectioned one:
+// no digits anywhere (kills "NOTES:1.", "G13.Risk Management…", cover-page
+// year ranges), 2–12 words in at most 60 runes, no dangling punctuation,
+// and keywords must prefix the line rather than appear anywhere in it.
+func isHeadingLine(line string) bool {
+	s := strings.TrimSpace(line)
+	if s == "" || utf8.RuneCountInString(s) > 60 {
 		return false
 	}
+	if strings.ContainsAny(s, "0123456789") {
+		return false
+	}
+	words := strings.Fields(s)
+	if len(words) < 2 || len(words) > 12 {
+		return false
+	}
+	switch s[len(s)-1] {
+	case '-', ':', ',':
+		return false
+	}
+
 	var letters, upper int
 	for _, r := range s {
 		if unicode.IsLetter(r) {
@@ -146,16 +185,15 @@ func isAnnualHeading(text string) bool {
 	if letters >= 3 && upper*5 >= letters*4 { // >=80% capitals
 		return true
 	}
-	lower := strings.ToLower(s)
+
+	cleaned := headingPrefixRE.ReplaceAllString(strings.ToLower(s), "")
+	if cleaned == "" {
+		return false
+	}
 	for _, kw := range annualHeadings {
-		if strings.Contains(lower, kw) {
+		if strings.HasPrefix(cleaned, kw) {
 			return true
 		}
 	}
 	return false
-}
-
-// headingTitle normalises a heading for use as chunk context.
-func headingTitle(text string) string {
-	return strings.Join(strings.Fields(text), " ")
 }

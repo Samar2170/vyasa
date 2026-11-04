@@ -87,12 +87,19 @@ func (t *SearchTool) Execute(ctx context.Context, args string) types.ExecutionOu
 
 	var b strings.Builder
 	for i, h := range hits {
+		label := h.Segment
+		if h.Period != "" {
+			label += " " + h.Period
+		}
+		if h.IsQuarterly {
+			label += " [quarterly]"
+		}
 		section := ""
 		if h.Section != "" {
 			section = " — " + h.Section
 		}
 		fmt.Fprintf(&b, "[%d] score %.4f — %s %s%s\n%s\nsource: %s\n\n",
-			i+1, h.Score, h.Symbol, h.Segment, section, h.Text, h.DocumentURL)
+			i+1, h.Score, h.Symbol, label, section, h.Text, h.DocumentURL)
 	}
 	return types.ExecutionOutput{
 		Output:   strings.TrimSpace(b.String()),

@@ -19,7 +19,9 @@ MANAGEMENT DISCUSSION AND ANALYSIS
 Demand remained healthy through the year.
 `
 
-func TestAnnualReportChunkerSections(t *testing.T) {
+// TestAnnualReportChunkerPages pins the context contract: chunks carry only
+// their page number, never a parsed section title.
+func TestAnnualReportChunkerPages(t *testing.T) {
 	got := AnnualReportChunker{}.Chunk(markedDoc)
 	if len(got) < 3 {
 		t.Fatalf("got %d chunks, want >=3: %+v", len(got), got)
@@ -32,20 +34,20 @@ func TestAnnualReportChunkerSections(t *testing.T) {
 		t.Errorf("intro chunk context = %q, want empty", got[0].Context)
 	}
 
-	var directors, mda bool
+	var page1, page2 bool
 	for _, c := range got {
-		if strings.Contains(c.Context, "Directors' Report") && strings.Contains(c.Context, "page 1") {
-			directors = true
+		switch c.Context {
+		case "page 1":
+			page1 = true
+		case "page 2":
+			page2 = true
 		}
-		if strings.Contains(c.Context, "MANAGEMENT DISCUSSION") && strings.Contains(c.Context, "page 2") {
-			mda = true
-		}
-		if !strings.Contains(markedDoc[:len(markedDoc)], "") && c.Offset < 0 {
+		if c.Offset < 0 {
 			t.Errorf("bad offset %d", c.Offset)
 		}
 	}
-	if !directors || !mda {
-		t.Errorf("missing section contexts: %+v", got)
+	if !page1 || !page2 {
+		t.Errorf("missing page contexts: %+v", got)
 	}
 }
 
@@ -85,6 +87,41 @@ EBITDA margin up 120 bps
 	}
 	if got[len(got)-1].Context != "slide 3" {
 		t.Errorf("last context = %q, want slide 3", got[len(got)-1].Context)
+	}
+}
+
+// Junk lines observed in production rag_chunks data must never be picked
+// up as section headings — a wrong heading sticks to hundreds of chunks.
+func TestAnnualHeadingJunkRejected(t *testing.T) {
+	junk := []string{
+		"SGS",
+		"BRSR",
+		"NOTES:1.",
+		"G13.Risk ManagementCritical (Tier I)-",
+		"INTEGRATED ANNUALREPORT 2025-26MAHINDRA & MAHINDRA LIMITED",
+		"Risk ManagementCritical (Tier I)-",
+	}
+	for _, s := range junk {
+		if isAnnualHeading(s) {
+			t.Errorf("junk accepted as heading: %q", s)
+		}
+	}
+}
+
+func TestAnnualHeadingRealSectionsAccepted(t *testing.T) {
+	headings := []string{
+		"DIRECTORS' REPORT",
+		"MANAGEMENT DISCUSSION AND ANALYSIS",
+		"Notes to the Financial Statements",
+		"INDEPENDENT AUDITOR'S REPORT",
+		"REPORT OF THE AUDITOR",
+		"III. CORPORATE GOVERNANCE REPORT",
+		"Financial Highlights",
+	}
+	for _, s := range headings {
+		if !isAnnualHeading(s) {
+			t.Errorf("heading rejected: %q", s)
+		}
 	}
 }
 

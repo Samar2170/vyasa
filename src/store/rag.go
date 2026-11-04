@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -46,10 +47,11 @@ func (s *Store) InsertRAGChunks(ctx context.Context, chunks []models.RAGChunk) e
 	b := &pgx.Batch{}
 	for _, c := range chunks {
 		b.Queue(`INSERT INTO rag_chunks
-				(company_id, symbol, segment, document_url, ordinal, "offset", section, text, embedding, model, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::vector, $10, $11, $11)`,
+				(company_id, symbol, segment, document_url, ordinal, "offset", section, text, embedding, model, period, source, is_quarterly, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::vector, $10, $11, $12, $13, $14, $14)`,
 			c.CompanyID, c.Symbol, c.Segment, c.DocumentURL, c.Ordinal, c.Offset,
-			c.Section, c.Text, vectorLiteral(c.Embedding), c.Model, now)
+			c.Section, c.Text, vectorLiteral(c.Embedding), c.Model,
+			c.Period, c.Source, c.IsQuarterly, now)
 	}
 	if err := s.Pool.SendBatch(ctx, b).Close(); err != nil {
 		return fmt.Errorf("store: insert rag_chunks: %w", err)
@@ -57,12 +59,15 @@ func (s *Store) InsertRAGChunks(ctx context.Context, chunks []models.RAGChunk) e
 	return nil
 }
 
-const ragChunkColumns = `id, company_id, symbol, segment, document_url, ordinal, "offset", section, text, model`
+const ragChunkColumns = `id, company_id, symbol, segment, document_url, ordinal, "offset", section, text, model, period, source, is_quarterly`
 
-func scanRAGChunk(rows pgx.Rows) (models.RAGChunk, error) {
+func scanRAGChunk(rows pgx.Rows, extra ...any) (models.RAGChunk, error) {
 	var c models.RAGChunk
-	err := rows.Scan(&c.ID, &c.CompanyID, &c.Symbol, &c.Segment, &c.DocumentURL,
-		&c.Ordinal, &c.Offset, &c.Section, &c.Text, &c.Model)
+	dests := []any{&c.ID, &c.CompanyID, &c.Symbol, &c.Segment, &c.DocumentURL,
+		&c.Ordinal, &c.Offset, &c.Section, &c.Text, &c.Model,
+		&c.Period, &c.Source, &c.IsQuarterly}
+	dests = append(dests, extra...)
+	err := rows.Scan(dests...)
 	return c, err
 }
 
@@ -79,18 +84,29 @@ func (s *Store) SearchRAGVector(ctx context.Context, companyID, segment, qvec st
 	return collectRAGChunks(rows)
 }
 func (s *Store) SearchRAGLexical(ctx context.Context, companyID, segment, query string, topK int) ([]models.RAGChunk, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT`+ragChunkColumns+`ts_rank_cd(rag_chunks.tsv,
-	query) AS score
-	FROM rag_chunks, websearch_to_tsquery('english', $3) AS query
-	WHERE rag_chunks.tsv @@ query
-	 AND ($1 = '' OR company_id = $1) AND ($2 = '' OR segment = $2)
-	ORDER BY score DESC
-	LIMIT $4`, companyID, segment, query, topK)
+	rows, err := s.Pool.Query(ctx, `SELECT `+ragChunkColumns+`, ts_rank_cd(rag_chunks.tsv, query) AS score
+		FROM rag_chunks, websearch_to_tsquery('english', $3) AS query
+		WHERE rag_chunks.tsv @@ query
+		  AND ($1 = '' OR company_id = $1) AND ($2 = '' OR segment = $2)
+		ORDER BY score DESC
+		LIMIT $4`, companyID, segment, query, topK)
 	if err != nil {
 		return nil, fmt.Errorf("store: lexical search: %w", err)
 	}
 	defer rows.Close()
-	return collectRAGChunks(rows)
+
+	// the lexical rank itself is not used downstream — RRF re-ranks by
+	// position — so it is scanned and discarded
+	var out []models.RAGChunk
+	for rows.Next() {
+		var rank float64
+		c, err := scanRAGChunk(rows, &rank)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan rag chunk: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 func collectRAGChunks(rows pgx.Rows) ([]models.RAGChunk, error) {
@@ -145,7 +161,7 @@ func FuseRRF(vecHits, lexHits []models.RAGChunk, topK int) []models.RAGHit {
 	byID := make(map[string]models.RAGChunk, len(vecHits)+len(lexHits))
 	accumulate := func(hits []models.RAGChunk) {
 		for i, h := range hits {
-			scores[h.ID] = 1.0 / float64(rrfK+i+1)
+			scores[h.ID] += 1.0 / float64(rrfK+i+1)
 			if _, ok := byID[h.ID]; !ok {
 				byID[h.ID] = h
 			}
@@ -184,7 +200,10 @@ type PendingResource struct {
 	CompanyID       string
 	Symbol          string
 	AnalysisSegment string
+	Source          string // provenance, e.g. "investor_relations"
 	DocumentURL     string // research_resource_link
+	AnchorText      string // extracted_data.anchor_text
+	RawDataUrl      string // extracted_data.pdf_path
 	TextPath        string // extracted_data.text_path
 }
 
@@ -192,7 +211,9 @@ type PendingResource struct {
 // oldest company first.
 func (s *Store) UnindexedResources(ctx context.Context) ([]PendingResource, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT r.company_id, c.symbol, r.analysis_segment, r.research_resource_link,
+		SELECT r.company_id, c.symbol, r.analysis_segment, r.source, r.research_resource_link,
+		       COALESCE(r.extracted_data->>'anchor_text', ''),
+		       COALESCE(r.extracted_data->>'pdf_path', ''),
 		       COALESCE(r.extracted_data->>'text_path', '')
 		FROM company_research_resources r
 		JOIN companies c ON c.id = r.company_id
@@ -206,11 +227,25 @@ func (s *Store) UnindexedResources(ctx context.Context) ([]PendingResource, erro
 	var out []PendingResource
 	for rows.Next() {
 		var p PendingResource
-		if err := rows.Scan(&p.CompanyID, &p.Symbol, &p.AnalysisSegment,
-			&p.DocumentURL, &p.TextPath); err != nil {
+		if err := rows.Scan(&p.CompanyID, &p.Symbol, &p.AnalysisSegment, &p.Source,
+			&p.DocumentURL, &p.AnchorText, &p.RawDataUrl, &p.TextPath); err != nil {
 			return nil, fmt.Errorf("store: scan pending resource: %w", err)
 		}
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// ResetResourcesIndexed flags every investor-relations resource row as
+// unindexed so the next rag-index run re-chunks and re-embeds it.
+func (s *Store) ResetResourcesIndexed(ctx context.Context, source string) error {
+	now := time.Now()
+	ct, err := s.Pool.Exec(ctx, `UPDATE company_research_resources
+		SET indexed = false, updated_at = $2
+		WHERE source = $1 AND extracted_data ? 'text_path'`, source, now)
+	if err != nil {
+		return fmt.Errorf("store: reset indexed for source %s: %w", source, err)
+	}
+	log.Printf("store: reset indexed on %d %s resources", ct.RowsAffected(), source)
+	return nil
 }

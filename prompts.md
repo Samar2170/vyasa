@@ -17,3 +17,12 @@ Thinking of these modules
     * Special tools
     * Orchestrator
     * Its own db saves
+
+
+
+#### Indexer
+1. We need to implement a RAG for our ir fetched reports. 
+2. We should implement a base indexer, that chunks it up, gets vector embeddings, stores it later for retrieval. (chunking function should be pluggable)
+3. We will use a new table
+4. 2 custom chunking functions for both annual reports & investor presentation
+5. For retrieval we will use semantic hybrid vector & lexical search. 
