@@ -194,6 +194,45 @@ func (s *Store) MarkResourceIndexed(ctx context.Context, companyID, segment stri
 	return nil
 }
 
+// RagSample carries the fields of one stored chunk needed for dataset
+// generation: its stable identity (symbol, segment, document, ordinal) plus
+// the chunk text, context and fiscal period.
+type RagSample struct {
+	Symbol      string
+	Segment     string
+	DocumentURL string
+	Section     string
+	Period      string
+	Ordinal     int
+	Text        string
+}
+
+// ListRAGChunks returns every stored chunk of one (symbol, segment) in
+// document order, for sampling evaluation questions. Empty filters match
+// everything.
+func (s *Store) ListRAGChunks(ctx context.Context, symbol, segment string) ([]RagSample, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT symbol, segment, document_url, section, period, ordinal, text
+		FROM rag_chunks
+		WHERE ($1 = '' OR symbol = $1) AND ($2 = '' OR segment = $2)
+		ORDER BY symbol, segment, document_url, ordinal`, symbol, segment)
+	if err != nil {
+		return nil, fmt.Errorf("store: list rag chunks: %w", err)
+	}
+	defer rows.Close()
+
+	var out []RagSample
+	for rows.Next() {
+		var r RagSample
+		if err := rows.Scan(&r.Symbol, &r.Segment, &r.DocumentURL, &r.Section,
+			&r.Period, &r.Ordinal, &r.Text); err != nil {
+			return nil, fmt.Errorf("store: scan rag chunk: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // PendingResource is one unindexed company_research_resources row with the
 // fields the rag-index backfill needs.
 type PendingResource struct {

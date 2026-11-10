@@ -13,10 +13,12 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"vyasa/seed/equity"
 	"vyasa/src/client"
 	"vyasa/src/client/archivus"
 	"vyasa/src/client/av"
@@ -25,12 +27,12 @@ import (
 	"vyasa/src/client/tickertape"
 	"vyasa/src/client/tickertapev2"
 	"vyasa/src/config"
+	"vyasa/src/eval"
 	"vyasa/src/llm"
 	"vyasa/src/llm/providers/openrouter"
 	"vyasa/src/models"
 	"vyasa/src/rag"
 	"vyasa/src/store"
-	"vyasa/wf/equity"
 )
 
 func main() {
@@ -94,6 +96,22 @@ func main() {
 			log.Fatal("rag-search requires -symbol SYMBOL and -query QUERY")
 		}
 		runRAGSearch(ctx, st, settings, *symbol, *segment, *query, *k)
+	case "rag-eval-gen":
+		fs := flag.NewFlagSet("rag-eval-gen", flag.ExitOnError)
+		symbols := fs.String("symbol", "", "comma-separated symbols to sample (default: every indexed symbol)")
+		n := fs.Int("n", 60, "approximate number of questions to generate")
+		out := fs.String("out", "dataset/rag_golden.jsonl", "output JSONL path")
+		_ = fs.Parse(os.Args[2:])
+		runRAGEvalGen(ctx, st, settings, parseSources(*symbols), *n, *out)
+	case "rag-eval":
+		fs := flag.NewFlagSet("rag-eval", flag.ExitOnError)
+		dataset := fs.String("dataset", "dataset/rag_golden.jsonl", "golden dataset JSONL")
+		k := fs.String("k", "1,3,5,8,10", "comma-separated k cutoffs")
+		strict := fs.Bool("strict", false, "score exact ordinals only (no +-1 neighbour tolerance)")
+		symbol := fs.String("symbol", "", "optional symbol filter")
+		out := fs.String("out", "", "optional path for per-item results JSONL")
+		_ = fs.Parse(os.Args[2:])
+		runRAGEval(ctx, st, settings, *dataset, *k, *strict, *symbol, *out)
 	default:
 		usage()
 	}
@@ -114,7 +132,13 @@ commands:
   rag-index index archived filings (chunk, embed, store): [-force] re-index
             even already-indexed investor-relations filings
   rag-search hybrid semantic+keyword search over indexed filings:
-            -symbol RELIANCE -query "capex guidance" [-segment ...] [-k 8]`)
+            -symbol RELIANCE -query "capex guidance" [-segment ...] [-k 8]
+  rag-eval-gen draft a retrieval-eval golden dataset from indexed chunks:
+            [-symbol CSV] [-n 60] [-out dataset/rag_golden.jsonl] (review the
+            draft by hand before running rag-eval on it)
+  rag-eval replay a golden dataset through hybrid search and score
+            Hit@k/Recall/MRR/nDCG: [-dataset dataset/rag_golden.jsonl]
+            [-k 1,3,5,8,10] [-strict] [-symbol RELIANCE] [-out results.jsonl]`)
 	os.Exit(2)
 }
 
@@ -491,4 +515,79 @@ func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings
 		fmt.Printf("[%d] score %.4f — %s %s%s\n%s\nsource: %s\n\n",
 			i+1, h.Score, h.Symbol, label, section, h.Text, h.DocumentURL)
 	}
+}
+
+// runRAGEvalGen drafts the golden retrieval-eval dataset: it samples indexed
+// chunks and asks the model to write one grounded question per chunk. The
+// draft is meant to be reviewed and curated by hand before rag-eval uses it.
+func runRAGEvalGen(ctx context.Context, st *store.Store, settings config.Settings, symbols []string, n int, out string) {
+	client, err := llm.NewClient(settings.Provider, mustLLM(settings))
+	if err != nil {
+		log.Fatalf("rag-eval-gen: %v", err)
+	}
+	if _, err := eval.Generate(ctx, st, client, eval.GenOptions{
+		Symbols: symbols,
+		Total:   n,
+		Workers: 3,
+	}, out); err != nil {
+		log.Fatalf("rag-eval-gen: %v", err)
+	}
+}
+
+// runRAGEval replays the golden dataset through the production hybrid search
+// and prints Hit@k / Recall@k / MRR / nDCG, overall and broken down by
+// segment and symbol.
+func runRAGEval(ctx context.Context, st *store.Store, settings config.Settings, dataset, ks string, strict bool, symbol, out string) {
+	items, err := eval.LoadJSONL(dataset)
+	if err != nil {
+		log.Fatalf("rag-eval: %v", err)
+	}
+	cutoffs, err := parseKs(ks)
+	if err != nil {
+		log.Fatalf("rag-eval: %v", err)
+	}
+	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+
+	opts := eval.RunOptions{Ks: cutoffs, Window: 1, Segment: ""}
+	if strict {
+		opts.Window = 0
+	}
+	if symbol != "" {
+		opts.Symbols = map[string]bool{strings.ToUpper(strings.TrimSpace(symbol)): true}
+	}
+	rep, err := eval.Run(ctx, ix, st, items, opts)
+	if err != nil {
+		log.Fatalf("rag-eval: %v", err)
+	}
+	rep.Print(os.Stdout)
+	if out != "" {
+		if err := rep.SaveResults(out); err != nil {
+			log.Fatalf("rag-eval: %v", err)
+		}
+		log.Printf("[rag-eval] per-item results written to %s", out)
+	}
+	if rep.Failed > 0 {
+		log.Printf("[rag-eval] warning: %d items skipped (%s)", rep.Failed, "symbol not seeded")
+	}
+}
+
+// parseKs parses the -k flag into sorted positive cutoffs.
+func parseKs(spec string) ([]int, error) {
+	var out []int
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		k, err := strconv.Atoi(part)
+		if err != nil || k <= 0 {
+			return nil, fmt.Errorf("invalid k %q", part)
+		}
+		out = append(out, k)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no valid k in %q", spec)
+	}
+	sort.Ints(out)
+	return out, nil
 }

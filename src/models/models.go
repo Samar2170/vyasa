@@ -24,6 +24,7 @@ type BaseModel struct {
 }
 
 type Company struct {
+	
 	BaseModel
 	Symbol   string `json:"symbol"`
 	Exchange string `json:"exchange,omitempty"`
