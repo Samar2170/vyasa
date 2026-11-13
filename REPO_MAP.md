@@ -15,6 +15,7 @@ same LLM and tool interfaces.
 | `seed` | load companies from the NSE equity master list (EQUITY_L.csv) into PostgreSQL |
 | `collect` | fetch market data for one company from `indiasm`, `tickertape`, `tickertapev2`, `av` sources concurrently, with fallbacks |
 | `ir` | fetch and archive a company's IR filings: annual report, investor presentation, earnings-call transcript, latest quarterly financials |
+| `metrics` | compute per-FY key metrics from the annual tickertape statements and store them in ticker_metrics |
 | `rag-index` | chunk + embed + store every unindexed archived filing (PDF re-extracted for `[[page N]]` markers; `-force` re-indexes) |
 | `rag-search` | hybrid semantic+keyword search over one company's filings, reranked by a cross-encoder |
 | `rag-eval-gen` | draft a golden retrieval-eval dataset from indexed chunks (LLM writes one grounded question per sampled chunk) |
@@ -103,19 +104,23 @@ same LLM and tool interfaces.
 │   │           ├── convert.go   #   request/response translation ↔ wire format
 │   │           ├── wire.go      #   wire types (JSON payloads)
 │   │           └── *_test.go
-│   ├── models/                  # package models: persisted domain types + PostgreSQL table names
-│   │   ├── models.go            #   Company, CompanyLink, CompanyResearchResource, saved_files…
-│   │   └── market.go            #   market-data tables (av_timeseries, indiasm_stock, tickertape, api_usage)
+│   ├── models/                    # package models: persisted domain types + PostgreSQL table names
+│   │   ├── models.go              #   Company, CompanyLink, CompanyResearchResource, saved_files…
+│   │   └── market.go              #   market-data tables (av_timeseries, indiasm_stock, tickertape, api_usage) + TickerMetrics row
 │   ├── rag/                     # package rag: the RAG core
 │   │   ├── rag.go               #   Indexer: chunk → embed → store (idempotent per company+segment); Search: hybrid pool → rerank → top-K
 │   │   ├── period.go            #   DerivePeriod: normalizes "FY 2025 - 26"/"Q1 FY27"/URL shapes into FY/Q labels
 │   │   ├── tools.go             #   SearchTool: hybrid retrieval exposed to agents as a types.Tool (rag_search)
 │   │   └── *_test.go
-│   ├── store/                   # package store: PostgreSQL connection, schema, and all queries
-│   │   ├── store.go             #   Store: idempotent schema creation (pgx), jsonb payloads + indexed columns
-│   │   ├── tables.go            #   per-section tickertape tables (shared schema)
-│   │   ├── company.go           #   GetCompany, CreateMissingCompanies (seed path)
-│   │   ├── rag.go               #   RAG queries: insert/delete chunks, vector + lexical search, SearchRAGHybrid + FuseRRF, MarkResourceIndexed
+│   ├── metrics/                  # package metrics: per-FY key metrics from the annual statements
+│   │   ├── metrics.go            #   statement parsing (FY rows only, TTM dropped) + Compute: raw copies, growth/CAGR, DOL, margins, returns, solvency, working capital, cash-flow ratios; per-row data_gaps
+│   │   └── metrics_test.go       #   compute fixtures mirroring the stored statement JSON
+│   ├── store/                    # package store: PostgreSQL connection, schema, and all queries
+│   │   ├── store.go              #   Store: idempotent schema creation (pgx), jsonb payloads + indexed columns
+│   │   ├── tables.go             #   per-section tickertape tables (shared schema)
+│   │   ├── company.go            #   GetCompany, CreateMissingCompanies (seed path)
+│   │   ├── metrics.go            #   LatestStatement reads, MetricsSymbols listing, UpsertMetrics into ticker_metrics
+│   │   ├── rag.go                #   RAG queries: insert/delete chunks, vector + lexical search, SearchRAGHybrid + FuseRRF, MarkResourceIndexed
 │   │   ├── rerank_cache.go      #   persistent rerank-score cache (pair-hash keyed)
 │   │   └── rag_test.go
 │   └── types/                   # package types: Tool interface + Registry shared by agent, llm, rag
@@ -147,6 +152,7 @@ same LLM and tool interfaces.
 | `src/client` | Data-source + storage interfaces; concrete clients: `archivus`, `av`, `indiasm`, `ir`, `tickertape`, `tickertapev2` |
 | `src/config` | `config.json` settings + `.env` secret loading |
 | `src/eval` | Golden-dataset generation and retrieval metrics (Hit@k, Recall@k, MRR, nDCG) |
+| `src/metrics` | Per-FY key metrics derived from the annual tickertape statements (raw copies, growth, margins, returns, solvency, working capital, cash flow) |
 | `src/helpers` | Small shared utilities |
 | `src/llm` | Provider-agnostic LLM clients, embeddings, reranker, budgets, transports; `providers/openrouter` |
 | `src/models` | Domain types + table names (jsonb payloads, indexed columns) |
@@ -159,9 +165,11 @@ same LLM and tool interfaces.
 ```
 EQUITY_L.csv ──seed──▶ companies (Postgres)
                          │
-              collect ───┼──▶ indiasm / av / tickertape* ──▶ market tables + Archivus archive
-                         │
-                    ir ──┴──▶ IR filings ──▶ company_research_resources + Archivus
+               collect ───┼──▶ indiasm / av / tickertape* ──▶ market tables + Archivus archive
+                          │
+              metrics ────┼──▶ annual statements ──▶ ticker_metrics (per-FY key metrics)
+                          │
+                     ir ──┴──▶ IR filings ──▶ company_research_resources + Archivus
                                               │
                                         rag-index (chunk ▸ embed ▸ store) ──▶ rag_chunks
                                               │

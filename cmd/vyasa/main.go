@@ -30,6 +30,7 @@ import (
 	"vyasa/src/eval"
 	"vyasa/src/llm"
 	"vyasa/src/llm/providers/openrouter"
+	"vyasa/src/metrics"
 	"vyasa/src/models"
 	"vyasa/src/rag"
 	"vyasa/src/store"
@@ -97,6 +98,11 @@ func main() {
 			log.Fatal("rag-search requires -symbol SYMBOL and -query QUERY")
 		}
 		runRAGSearch(ctx, st, settings, *symbol, *segment, *query, *k, *rerank)
+	case "metrics":
+		fs := flag.NewFlagSet("metrics", flag.ExitOnError)
+		symbols := fs.String("symbol", "", "comma-separated symbols (default: every symbol with statement data)")
+		_ = fs.Parse(os.Args[2:])
+		runMetrics(ctx, st, parseSymbols(*symbols))
 	case "rag-eval-gen":
 		fs := flag.NewFlagSet("rag-eval-gen", flag.ExitOnError)
 		symbols := fs.String("symbol", "", "comma-separated symbols to sample (default: every indexed symbol)")
@@ -132,6 +138,9 @@ commands:
             saved pages in tickertape_files/)
   ir        fetch and archive investor-relations filings (annual report,
             presentation, transcript, quarterly financials): -symbol RELIANCE
+  metrics   compute per-FY key metrics from the annual statement tables and
+            store them in ticker_metrics: [-symbol CSV] (default: every
+            symbol with statement data)
   rag-index index archived filings (chunk, embed, store): [-force] re-index
             even already-indexed investor-relations filings
   rag-search hybrid semantic+keyword search over indexed filings, reranked
@@ -564,6 +573,77 @@ func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings
 		fmt.Printf("[%d] %s — %s %s%s\n%s\nsource: %s\n\n",
 			i+1, score, h.Symbol, label, section, h.Text, h.DocumentURL)
 	}
+}
+
+// parseSymbols splits the -symbol list, trims it and dedupes it. Unlike
+// parseSources the values keep their case: symbols are case-sensitive
+// (M&M, WAAREEENER).
+func parseSymbols(list string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, s := range strings.Split(list, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// runMetrics derives the per-FY key metrics from the latest annual statement
+// snapshots and upserts them into ticker_metrics. With no -symbol list it
+// recomputes every symbol that has statement data.
+func runMetrics(ctx context.Context, st *store.Store, symbols []string) {
+	if len(symbols) == 0 {
+		var err error
+		symbols, err = st.MetricsSymbols(ctx)
+		if err != nil {
+			log.Fatalf("metrics: %v", err)
+		}
+		if len(symbols) == 0 {
+			log.Printf("[metrics] no statement data to compute from (run: vyasa collect)")
+			return
+		}
+		log.Printf("[metrics] %d symbols with statement data", len(symbols))
+	}
+
+	var okCount, skipped, failed int
+	for _, sym := range symbols {
+		co, err := st.GetCompany(ctx, sym)
+		if err != nil {
+			log.Fatalf("metrics: %v", err)
+		}
+		if co == nil {
+			co = &models.Company{Symbol: sym}
+		}
+		rows, err := metrics.Compute(ctx, st, *co)
+		if err != nil {
+			log.Printf("[metrics] %s: FAILED: %v", sym, err)
+			failed++
+			continue
+		}
+		if len(rows) == 0 {
+			log.Printf("[metrics] %s: no statement data, skipping", sym)
+			skipped++
+			continue
+		}
+		if err := st.UpsertMetrics(ctx, rows); err != nil {
+			log.Printf("[metrics] %s: FAILED: %v", sym, err)
+			failed++
+			continue
+		}
+		gapped := 0
+		for _, r := range rows {
+			if len(r.DataGaps) > 0 {
+				gapped++
+			}
+		}
+		log.Printf("[metrics] %s: %d FYs stored (%d with gaps)", sym, len(rows), gapped)
+		okCount++
+	}
+	log.Printf("[metrics] %d symbols: %d ok, %d skipped, %d failed", len(symbols), okCount, skipped, failed)
 }
 
 // runRAGEvalGen drafts the golden retrieval-eval dataset: it samples indexed

@@ -304,6 +304,98 @@ CREATE TABLE IF NOT EXISTS rerank_score_cache (
 );
 `
 
+// tickerMetricsSchema holds the per-FY derived metrics computed from the
+// annual statement tables. Every metric is a real column (NULL when the
+// inputs are missing) so the series stay directly queryable; data_gaps
+// records which inputs were missing for each FY.
+const tickerMetricsSchema = `
+CREATE TABLE IF NOT EXISTS ticker_metrics (
+	id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+	company_id text NOT NULL DEFAULT '',
+	symbol text NOT NULL,
+	fy text NOT NULL,
+	end_date date NOT NULL,
+	data_gaps jsonb NOT NULL DEFAULT '[]'::jsonb,
+
+	total_revenue double precision,
+	gross_profit double precision,
+	ebitda double precision,
+	ebit double precision,
+	pbt double precision,
+	net_income double precision,
+	eps double precision,
+	cfo double precision,
+	capex double precision,
+	fcf double precision,
+	total_equity double precision,
+	minority_interest double precision,
+	net_worth double precision,
+	total_debt double precision,
+	cash_and_sti double precision,
+	total_assets double precision,
+	current_assets double precision,
+	current_liabilities double precision,
+	receivables double precision,
+	inventory double precision,
+	payables double precision,
+	shares_outstanding double precision,
+
+	revenue_yoy double precision,
+	revenue_cagr_3y double precision,
+	revenue_cagr_5y double precision,
+	ebitda_yoy double precision,
+	ebitda_cagr_3y double precision,
+	ebitda_cagr_5y double precision,
+	ebit_yoy double precision,
+	ebit_cagr_3y double precision,
+	ebit_cagr_5y double precision,
+	pat_yoy double precision,
+	pat_cagr_3y double precision,
+	pat_cagr_5y double precision,
+	eps_yoy double precision,
+	eps_cagr_3y double precision,
+	eps_cagr_5y double precision,
+
+	dol_ebit double precision,
+	dol_ebitda double precision,
+	gross_margin double precision,
+	ebitda_margin double precision,
+	ebit_margin double precision,
+	net_margin double precision,
+
+	roe double precision,
+	ronw double precision,
+	roce double precision,
+	roic double precision,
+
+	debt_to_equity double precision,
+	net_debt double precision,
+	net_debt_to_ebitda double precision,
+	interest_coverage double precision,
+	current_ratio double precision,
+
+	dso_days double precision,
+	dio_days double precision,
+	dpo_days double precision,
+	wc_cycle_days double precision,
+	receivables_yoy double precision,
+	receivables_pct_revenue double precision,
+	inventory_yoy double precision,
+	inventory_pct_revenue double precision,
+	payables_yoy double precision,
+	payables_pct_cogs double precision,
+
+	fcf_margin double precision,
+	cfo_to_pat double precision,
+	fcf_to_pat double precision,
+	cfo_to_ebitda double precision,
+
+	created_at timestamptz NOT NULL DEFAULT now(),
+	updated_at timestamptz NOT NULL DEFAULT now(),
+	UNIQUE (symbol, fy)
+);
+`
+
 // Migrate creates the schema if it does not exist yet.
 func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.Pool.Exec(ctx, schema); err != nil {
@@ -314,6 +406,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.Pool.Exec(ctx, rerankCacheSchema); err != nil {
 		return fmt.Errorf("store: migrate rerank_cache: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, tickerMetricsSchema); err != nil {
+		return fmt.Errorf("store: migrate ticker_metrics: %w", err)
 	}
 
 	for _, table := range tickerSectionTables() {
