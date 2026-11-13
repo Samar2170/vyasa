@@ -49,7 +49,9 @@ func (c *Client) download(ctx context.Context, u, referer string) ([]byte, error
 }
 
 // extractPDFText renders the plain text of every page, tolerating individual
-// page failures. Returns the text and the number of readable pages.
+// page failures. Pages are separated by [[page N]] marker lines so the
+// structure-aware chunkers can key off page boundaries. Returns the text
+// and the number of readable pages.
 func extractPDFText(data []byte) (string, int) {
 	r, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -65,10 +67,17 @@ func extractPDFText(data []byte) (string, int) {
 			continue
 		}
 		readable++
-		b.WriteString(strings.TrimRight(txt, " \t\n"))
-		b.WriteString("\n")
+		pageTxt := collapseBlankLines(strings.TrimRight(txt, " \t\n"))
+		if pageTxt == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		fmt.Fprintf(&b, "[[page %d]]\n\n", i)
+		b.WriteString(pageTxt)
 	}
-	return collapseBlankLines(b.String()), readable
+	return b.String(), readable
 }
 
 // safePageText guards against panics inside the pdf parser on malformed

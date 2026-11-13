@@ -30,23 +30,39 @@ type Chunk struct {
 	Ordinal int
 	Offset  int // rune offset of Text within the source document
 	Text    string
+	// Context is the chunker's enrichment line (section, slide) — stored
+	// with the chunk and prefixed to the text when embedding.
+	Context string
 }
 
 // Split divides text into overlapping chunks. It returns nil for empty input.
+// Split divides text into overlapping chunks of the default size. It
+// returns nil for empty input.
 func Split(text string) []Chunk {
+	return splitSized(text, defaultChunkSize, defaultOverlap)
+}
+
+// splitSized divides text into size-rune chunks with overlap-rune tails.
+func splitSized(text string, size, overlap int) []Chunk {
 	runes := []rune(text)
 	n := len(runes)
 	if n == 0 {
 		return nil
 	}
-	if n <= defaultChunkSize {
+	if overlap >= size {
+		overlap = size / 6
+	}
+	if overlap < 0 {
+		overlap = 0
+	}
+	if n <= size {
 		return []Chunk{{Ordinal: 0, Offset: 0, Text: text}}
 	}
 
-	step := defaultChunkSize - defaultOverlap
+	step := size - overlap
 	var out []Chunk
 	for start := 0; start < n; start += step {
-		end := start + defaultChunkSize
+		end := start + size
 		if end >= n {
 			end = n
 		}

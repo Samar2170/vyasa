@@ -11,12 +11,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"vyasa/internal/equity"
+	"vyasa/seed/equity"
 	"vyasa/src/client"
 	"vyasa/src/client/archivus"
 	"vyasa/src/client/av"
@@ -25,8 +27,11 @@ import (
 	"vyasa/src/client/tickertape"
 	"vyasa/src/client/tickertapev2"
 	"vyasa/src/config"
+	"vyasa/src/eval"
 	"vyasa/src/llm"
 	"vyasa/src/llm/providers/openrouter"
+	"vyasa/src/models"
+	"vyasa/src/rag"
 	"vyasa/src/store"
 )
 
@@ -74,6 +79,42 @@ func main() {
 		}
 		storage := mustArchivus(settings)
 		runIR(ctx, st, storage, settings, *symbol)
+	case "rag-index":
+		fs := flag.NewFlagSet("rag-index", flag.ExitOnError)
+		force := fs.Bool("force", false, "re-index every archived filing, even ones already indexed")
+		_ = fs.Parse(os.Args[2:])
+		storage := mustArchivus(settings)
+		runRAGIndex(ctx, st, storage, settings, *force)
+	case "rag-search":
+		fs := flag.NewFlagSet("rag-search", flag.ExitOnError)
+		symbol := fs.String("symbol", "", "company symbol to search filings for")
+		query := fs.String("query", "", "search query")
+		segment := fs.String("segment", "", "optional segment filter (annual_report, investor_presentation, earnings_call_transcript, quarterly_financials)")
+		k := fs.Int("k", 8, "max hits")
+		rerank := fs.Bool("rerank", true, "use the cross-encoder reranker (-rerank=false to disable)")
+		_ = fs.Parse(os.Args[2:])
+		if *symbol == "" || *query == "" {
+			log.Fatal("rag-search requires -symbol SYMBOL and -query QUERY")
+		}
+		runRAGSearch(ctx, st, settings, *symbol, *segment, *query, *k, *rerank)
+	case "rag-eval-gen":
+		fs := flag.NewFlagSet("rag-eval-gen", flag.ExitOnError)
+		symbols := fs.String("symbol", "", "comma-separated symbols to sample (default: every indexed symbol)")
+		n := fs.Int("n", 60, "approximate number of questions to generate")
+		out := fs.String("out", "dataset/rag_golden.jsonl", "output JSONL path")
+		_ = fs.Parse(os.Args[2:])
+		runRAGEvalGen(ctx, st, settings, parseSources(*symbols), *n, *out)
+	case "rag-eval":
+		fs := flag.NewFlagSet("rag-eval", flag.ExitOnError)
+		dataset := fs.String("dataset", "dataset/rag_golden.jsonl", "golden dataset JSONL")
+		k := fs.String("k", "1,3,5,8,10", "comma-separated k cutoffs")
+		strict := fs.Bool("strict", false, "score exact ordinals only (no +-1 neighbour tolerance)")
+		symbol := fs.String("symbol", "", "optional symbol filter")
+		out := fs.String("out", "", "optional path for per-item results JSONL")
+		rerank := fs.Bool("rerank", true, "use the cross-encoder reranker (-rerank=false to disable)")
+		budget := fs.Int("rerank-budget", settings.RerankBudget, "max cache-miss rerank pairs this run may bill (0 = unlimited)")
+		_ = fs.Parse(os.Args[2:])
+		runRAGEval(ctx, st, settings, *dataset, *k, *strict, *symbol, *out, *rerank, *budget)
 	default:
 		usage()
 	}
@@ -90,7 +131,19 @@ commands:
             capped per day by config.json; when it fails it falls back to
             saved pages in tickertape_files/)
   ir        fetch and archive investor-relations filings (annual report,
-            presentation, transcript, quarterly financials): -symbol RELIANCE`)
+            presentation, transcript, quarterly financials): -symbol RELIANCE
+  rag-index index archived filings (chunk, embed, store): [-force] re-index
+            even already-indexed investor-relations filings
+  rag-search hybrid semantic+keyword search over indexed filings, reranked
+            by a cross-encoder: -symbol RELIANCE -query "capex guidance"
+            [-segment ...] [-k 8] [-rerank=false]
+  rag-eval-gen draft a retrieval-eval golden dataset from indexed chunks:
+            [-symbol CSV] [-n 60] [-out dataset/rag_golden.jsonl] (review the
+            draft by hand before running rag-eval on it)
+  rag-eval replay a golden dataset through hybrid search and score
+            Hit@k/Recall/MRR/nDCG: [-dataset dataset/rag_golden.jsonl]
+            [-k 1,3,5,8,10] [-strict] [-symbol RELIANCE] [-out results.jsonl]
+            [-rerank=false] [-rerank-budget 2000]`)
 	os.Exit(2)
 }
 
@@ -101,7 +154,7 @@ func mustStore(ctx context.Context, settings config.Settings) *store.Store {
 	if err != nil {
 		log.Fatal(err)
 	}
-	st, err := store.New(ctx, dsn, settings.StorageSchema)
+	st, err := store.New(ctx, dsn, settings.StorageSchema, store.WithEmbeddingDim(settings.EmbeddingDim))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -247,7 +300,9 @@ func runIR(ctx context.Context, st *store.Store, storage client.StorageClient, s
 	log.Printf("[ir] %s (%s): %s", co.Symbol, co.Exchange, co.Name)
 
 	model := mustLLM(settings)
-	c := ir.New(storage, st, settings.Provider, model)
+	indexer := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+
+	c := ir.New(storage, st, settings.Provider, model, indexer)
 	start := time.Now()
 	if err := c.Execute(ctx, *co); err != nil {
 		log.Fatalf("ir: %v", err)
@@ -274,4 +329,327 @@ func mustLLM(settings config.Settings) llm.Config {
 		MaxRetries:   settings.MaxRetries,
 		Timeout:      settings.Timeout(),
 	}
+}
+
+// mustEmbedder builds the embeddings client from the provider API key and
+// the embedding_model / embedding_dim settings.
+func mustEmbedder(settings config.Settings) *llm.Embedder {
+	apiKey, err := config.RequireSecret(strings.ToUpper(settings.Provider) + "_API_KEY")
+	if err != nil {
+		log.Fatal(err)
+	}
+	return llm.NewEmbedder(llm.Config{
+		APIKey:     apiKey,
+		MaxRetries: settings.MaxRetries,
+		Timeout:    settings.Timeout(),
+	}, settings.EmbeddingModel, settings.EmbeddingDim).
+		WithProvider(providerOrder(settings.EmbeddingProvider))
+}
+
+// providerOrder splits a comma-separated OpenRouter provider routing order
+// (nil when empty) for the embeddings "provider" request field.
+func providerOrder(s string) []string {
+	parts := strings.Split(s, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// mustReranker builds the cross-encoder rerank client from the provider API
+// key and the rerank_model / rerank_pool settings, backed by a persistent
+// Postgres rerank-score cache. budget (nil = uncapped) limits the cache-miss
+// pairs the API may bill. Returns nil when rerank_enabled is false.
+func mustReranker(ctx context.Context, st *store.Store, settings config.Settings, budget *llm.RerankBudget) *llm.Reranker {
+	if !settings.RerankOn() {
+		return nil
+	}
+	apiKey, err := config.RequireSecret(strings.ToUpper(settings.Provider) + "_API_KEY")
+	if err != nil {
+		log.Fatal(err)
+	}
+	return llm.NewReranker(llm.Config{
+		APIKey:     apiKey,
+		MaxRetries: settings.MaxRetries,
+		Timeout:    settings.Timeout(),
+	}, settings.RerankModel).WithCache(st).WithBudget(budget)
+}
+
+// runRAGIndex indexes archived filings: for every pending resource it
+// re-extracts text from the archived PDF (so chunks get [[page N]] markers
+// and refreshed section detection), chunks + embeds + stores it, uploads the
+// refreshed text back to Archivus and marks the resource indexed. With
+// force, investor-relations resources already indexed are re-processed too.
+func runRAGIndex(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings, force bool) {
+	arch, ok := storage.(*archivus.ArchivusClient)
+	if !ok {
+		log.Fatal("rag-index: storage client does not support file lookup")
+	}
+	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+
+	if force {
+		if err := st.ResetResourcesIndexed(ctx, irSource); err != nil {
+			log.Fatalf("rag-index: %v", err)
+		}
+	}
+
+	pending, err := st.UnindexedResources(ctx)
+	if err != nil {
+		log.Fatalf("rag-index: %v", err)
+	}
+	if len(pending) == 0 {
+		log.Printf("[rag-index] every archived filing is indexed")
+		return
+	}
+
+	var failed int
+	for _, p := range pending {
+		start := time.Now()
+		text, err := filingText(arch, settings.StorageParentFolder, p)
+		if err != nil {
+			log.Printf("[rag-index] %s: %s: fetch %s: %v", p.Symbol, p.AnalysisSegment, p.RawDataUrl, err)
+			failed++
+			continue
+		}
+		co := models.Company{BaseModel: models.BaseModel{ID: p.CompanyID}, Symbol: p.Symbol}
+		meta := rag.DocMeta{
+			Segment:     p.AnalysisSegment,
+			DocumentURL: p.DocumentURL,
+			Period:      rag.DerivePeriod(p.AnchorText, p.DocumentURL, rag.TextHead(text, 4000)),
+			Source:      p.Source,
+			IsQuarterly: p.AnalysisSegment == "quarterly_financials",
+		}
+		n, err := ix.IndexDocument(ctx, co, meta, text)
+		if err != nil {
+			log.Printf("[rag-index] %s: %s: FAILED: %v", p.Symbol, p.AnalysisSegment, err)
+			failed++
+			continue
+		}
+		if err := st.MarkResourceIndexed(ctx, p.CompanyID, p.AnalysisSegment, true); err != nil {
+			log.Printf("[rag-index] %s: %s: mark indexed: %v", p.Symbol, p.AnalysisSegment, err)
+			failed++
+			continue
+		}
+		log.Printf("[rag-index] %s: %s: indexed %d chunks (period %s) in %s",
+			p.Symbol, p.AnalysisSegment, n, orDash(meta.Period), time.Since(start).Round(time.Second))
+	}
+	log.Printf("[rag-index] %d resources: %d ok, %d failed", len(pending), len(pending)-failed, failed)
+}
+
+const irSource = "investor_relations"
+
+// filingText fetches the parsed text of an archived filing. The archived PDF
+// is preferred and re-extracted so the text carries [[page N]] markers; the
+// stored text file is the fallback for unreadable PDFs. A successful PDF
+// re-extract is uploaded back to the same location so the archive stays
+// consistent with what was indexed.
+func filingText(arch *archivus.ArchivusClient, parentFolder string, p store.PendingResource) (string, error) {
+	if p.RawDataUrl != "" {
+		data, err := downloadArchivedFile(arch, parentFolder, p.RawDataUrl)
+		if err == nil {
+			text, pages := ir.ExtractPDFText(data)
+			if pages > 0 && strings.TrimSpace(text) != "" {
+				if txtName := fileNameOf(p.TextPath); txtName != "" {
+					if _, uerr := arch.UploadFile(folderRel(parentFolder, p.TextPath),
+						[]*archivus.UploadFile{{Name: txtName, Content: []byte(text)}}); uerr != nil {
+						log.Printf("[rag-index] %s: %s: refresh text upload: %v", p.Symbol, p.AnalysisSegment, uerr)
+					}
+				}
+				return text, nil
+			}
+			log.Printf("[rag-index] %s: %s: PDF re-extract empty (%d pages), falling back to stored text",
+				p.Symbol, p.AnalysisSegment, pages)
+		} else {
+			log.Printf("[rag-index] %s: %s: PDF fetch failed (%v), falling back to stored text",
+				p.Symbol, p.AnalysisSegment, err)
+		}
+	}
+	data, err := downloadArchivedFile(arch, parentFolder, p.TextPath)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// downloadArchivedFile fetches one archived file from Archivus. Stored paths
+// are absolute under the parent folder; LookupFile resolves against the
+// parent, so the prefix is stripped first.
+func downloadArchivedFile(arch *archivus.ArchivusClient, parentFolder, storedPath string) ([]byte, error) {
+	dir, name := folderRel(parentFolder, storedPath), fileNameOf(storedPath)
+	info, err := arch.LookupFile(dir, name)
+	if err != nil {
+		return nil, err
+	}
+	if info == nil {
+		return nil, fmt.Errorf("archivus: %s not found", storedPath)
+	}
+	data, _, err := arch.DownloadFile(info.ID)
+	return data, err
+}
+
+// folderRel converts a stored absolute-under-parent path to the
+// parent-relative folder LookupFile/UploadFile expect.
+func folderRel(parentFolder, storedPath string) string {
+	return strings.TrimPrefix(folderOf(storedPath), parentFolder+"/")
+}
+
+// fileNameOf returns the file name of a stored path.
+func fileNameOf(storedPath string) string {
+	_, name := path.Split(storedPath)
+	return name
+}
+
+// folderOf splits the directory from a stored path.
+func folderOf(storedPath string) string {
+	i := strings.LastIndexByte(storedPath, '/')
+	if i < 0 {
+		return ""
+	}
+	return storedPath[:i]
+}
+
+// orDash renders empty strings as a dash in logs and output.
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// runRAGSearch runs a hybrid search over one company's indexed filings and
+// prints the ranked chunks. With rerank on, the cross-encoder reorders a
+// deep candidate pool before truncation.
+func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings, symbol, segment, query string, k int, rerank bool) {
+	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+	if rerank {
+		ix = ix.WithReranker(mustReranker(ctx, st, settings, nil), settings.RerankPool)
+	}
+	co, err := st.GetCompany(ctx, symbol)
+	if err != nil {
+		log.Fatalf("rag-search: %v", err)
+	}
+	if co == nil {
+		log.Fatalf("rag-search: symbol %q not seeded (run: vyasa seed)", symbol)
+	}
+	hits, err := ix.Search(ctx, co.ID, segment, query, k)
+	if err != nil {
+		log.Fatalf("rag-search: %v", err)
+	}
+	if len(hits) == 0 {
+		fmt.Println("no matching passages")
+		return
+	}
+	for i, h := range hits {
+		label := h.Segment
+		if h.Period != "" {
+			label += " " + h.Period
+		}
+		if h.IsQuarterly {
+			label += " [quarterly]"
+		}
+		section := ""
+		if h.Section != "" {
+			section = " — " + h.Section
+		}
+		score := fmt.Sprintf("score %.4f", h.Score)
+		if h.Reranked {
+			score = fmt.Sprintf("rerank %.4f (rrf %.4f)", h.RerankScore, h.Score)
+		}
+		fmt.Printf("[%d] %s — %s %s%s\n%s\nsource: %s\n\n",
+			i+1, score, h.Symbol, label, section, h.Text, h.DocumentURL)
+	}
+}
+
+// runRAGEvalGen drafts the golden retrieval-eval dataset: it samples indexed
+// chunks and asks the model to write one grounded question per chunk. The
+// draft is meant to be reviewed and curated by hand before rag-eval uses it.
+func runRAGEvalGen(ctx context.Context, st *store.Store, settings config.Settings, symbols []string, n int, out string) {
+	client, err := llm.NewClient(settings.Provider, mustLLM(settings))
+	if err != nil {
+		log.Fatalf("rag-eval-gen: %v", err)
+	}
+	if _, err := eval.Generate(ctx, st, client, eval.GenOptions{
+		Symbols: symbols,
+		Total:   n,
+		Workers: 3,
+	}, out); err != nil {
+		log.Fatalf("rag-eval-gen: %v", err)
+	}
+}
+
+// runRAGEval replays the golden dataset through the production hybrid search
+// and prints Hit@k / Recall@k / MRR / nDCG, overall and broken down by
+// segment and symbol. With rerank on, the cross-encoder reorders the
+// candidate pool before truncation; budgetPairs > 0 caps the cache-miss
+// pairs the sweep may bill, with pool-over-budget items keeping RRF order.
+func runRAGEval(ctx context.Context, st *store.Store, settings config.Settings, dataset, ks string, strict bool, symbol, out string, rerank bool, budgetPairs int) {
+	items, err := eval.LoadJSONL(dataset)
+	if err != nil {
+		log.Fatalf("rag-eval: %v", err)
+	}
+	cutoffs, err := parseKs(ks)
+	if err != nil {
+		log.Fatalf("rag-eval: %v", err)
+	}
+	var budget *llm.RerankBudget
+	if budgetPairs > 0 {
+		budget = llm.NewRerankBudget(budgetPairs)
+	}
+	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+	if rerank {
+		ix = ix.WithReranker(mustReranker(ctx, st, settings, budget), settings.RerankPool)
+	}
+
+	opts := eval.RunOptions{Ks: cutoffs, Window: 1, Segment: ""}
+	if strict {
+		opts.Window = 0
+	}
+	if symbol != "" {
+		opts.Symbols = map[string]bool{strings.ToUpper(strings.TrimSpace(symbol)): true}
+	}
+	rep, err := eval.Run(ctx, ix, st, items, opts)
+	if err != nil {
+		log.Fatalf("rag-eval: %v", err)
+	}
+	rep.Print(os.Stdout)
+	if budget != nil {
+		log.Printf("[rag-eval] rerank budget: spent %d pairs, %d pools skipped, %d/%d left",
+			budget.Spent(), budget.Skipped(), budget.Left(), budgetPairs)
+	}
+	if out != "" {
+		if err := rep.SaveResults(out); err != nil {
+			log.Fatalf("rag-eval: %v", err)
+		}
+		log.Printf("[rag-eval] per-item results written to %s", out)
+	}
+	if rep.Failed > 0 {
+		log.Printf("[rag-eval] warning: %d items skipped (%s)", rep.Failed, "symbol not seeded")
+	}
+}
+
+// parseKs parses the -k flag into sorted positive cutoffs.
+func parseKs(spec string) ([]int, error) {
+	var out []int
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		k, err := strconv.Atoi(part)
+		if err != nil || k <= 0 {
+			return nil, fmt.Errorf("invalid k %q", part)
+		}
+		out = append(out, k)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no valid k in %q", spec)
+	}
+	sort.Ints(out)
+	return out, nil
 }

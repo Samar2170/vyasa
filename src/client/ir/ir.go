@@ -26,11 +26,11 @@ import (
 	"sync"
 	"time"
 
-	"vyasa/src/chunks"
 	"vyasa/src/client"
 	"vyasa/src/client/archivus"
 	"vyasa/src/llm"
 	"vyasa/src/models"
+	"vyasa/src/rag"
 	"vyasa/src/store"
 )
 
@@ -68,16 +68,18 @@ type Client struct {
 	store   *store.Store
 	llm     *llmChat
 	hc      *http.Client
+	indexer *rag.Indexer
 }
 
 // New creates the client. When cfg carries no API key the LLM chat handle is
 // nil and discovery relies on stored links and keyword matching only.
-func New(storage client.StorageClient, st *store.Store, provider string, cfg llm.Config) *Client {
+func New(storage client.StorageClient, st *store.Store, provider string, cfg llm.Config, indexer *rag.Indexer) *Client {
 	return &Client{
 		storage: storage,
 		store:   st,
 		llm:     newLLMChat(provider, cfg),
 		hc:      &http.Client{Timeout: httpTimeout},
+		indexer: indexer,
 	}
 }
 
@@ -324,14 +326,28 @@ func (c *Client) archiveAndRecord(ctx context.Context, co models.Company, result
 			}
 		}
 		if txtPath != "" {
-			if n, err := chunks.IndexText(ctx, c.store, co, r.Segment, r.Text); err != nil {
-				log.Printf("[ir] %s: %s: index text: %v", co.Symbol, r.Segment, err)
-			} else {
-				log.Printf("[ir] %s: %s: indexed %d chunks", co.Symbol, r.Segment, n)
+			if c.indexer != nil {
+				meta := rag.DocMeta{
+					Segment:     r.Segment,
+					DocumentURL: r.SourceURL,
+					Period:      rag.DerivePeriod(r.Anchor, r.SourceURL, rag.TextHead(r.Text, 4000)),
+					Source:      sourceIR,
+					IsQuarterly: r.Segment == SegQuarterly,
+				}
+				n, err := c.indexer.IndexDocument(ctx, co, meta, r.Text)
+				if err != nil {
+					log.Printf("[ir] %s: %s: index: %v", co.Symbol, r.Segment, err)
+				} else {
+					log.Printf("[ir] %s: %s: indexed %d chunks (period %s)", co.Symbol, r.Segment, n, orDefault(meta.Period, "-"))
+					if err := c.store.MarkResourceIndexed(ctx, co.ID, r.Segment, true); err != nil {
+						log.Printf("[ir] %s: %s: mark indexed: %v", co.Symbol, r.Segment, err)
+					}
+				}
 			}
 			if err := c.upsertSavedFile(ctx, co, r.TxtName, folderOf(txtPath), "txt", float64(r.TextChars)); err != nil {
 				return err
 			}
+
 		}
 	}
 	return firstErr

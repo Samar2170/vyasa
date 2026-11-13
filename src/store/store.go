@@ -18,9 +18,21 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+const defaultEmbedDim = 1536
+
 // Store wraps the connection pool.
 type Store struct {
 	Pool *pgxpool.Pool
+
+	embedDim int
+}
+
+type Option func(s *Store)
+
+func WithEmbeddingDim(dim int) Option {
+	return func(s *Store) {
+		s.embedDim = dim
+	}
 }
 
 // New connects to the PostgreSQL instance at dsn and applies the schema.
@@ -28,7 +40,7 @@ type Store struct {
 // gets `SET search_path TO <schema>` so unqualified SQL lands there, and a
 // privilege check fails fast with a clear error when the DSN role cannot use
 // it. An empty schema keeps the server default (usually public).
-func New(ctx context.Context, dsn, schema string) (*Store, error) {
+func New(ctx context.Context, dsn, schema string, opts ...Option) (*Store, error) {
 	if dsn == "" {
 		return nil, errors.New("store: postgres DSN is required")
 	}
@@ -41,7 +53,7 @@ func New(ctx context.Context, dsn, schema string) (*Store, error) {
 	if schema != "" {
 		sanitized := pgx.Identifier{schema}.Sanitize()
 		cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-			_, err := conn.Exec(ctx, "SET search_path TO "+sanitized)
+			_, err := conn.Exec(ctx, "SET search_path TO "+sanitized+", public")
 			return err
 		}
 	}
@@ -55,6 +67,11 @@ func New(ctx context.Context, dsn, schema string) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+
 	if schema != "" {
 		if err := s.bootstrapSchema(ctx, schema); err != nil {
 			pool.Close()
@@ -240,6 +257,51 @@ CREATE TABLE IF NOT EXISTS %[1]s (
 	updated_at timestamptz NOT NULL DEFAULT now(),
 	UNIQUE (symbol, date)
 );
+
+ALTER TABLE company_research_resources
+	ADD COLUMN IF NOT EXISTS indexed boolean NOT NULL DEFAULT false;
+`
+
+const ragChunksSchema = `
+
+CREATE TABLE IF NOT EXISTS rag_chunks (
+	id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+	company_id text NOT NULL,
+	symbol text NOT NULL DEFAULT '',
+	segment text NOT NULL DEFAULT '',
+	document_url text NOT NULL DEFAULT '',
+	ordinal integer NOT NULL DEFAULT 0,
+	"offset" integer NOT NULL DEFAULT 0,
+	section text NOT NULL DEFAULT '',
+	text text NOT NULL DEFAULT '',
+	embedding vector(%[1]d) NOT NULL,
+	model text NOT NULL DEFAULT '',
+	period text NOT NULL DEFAULT '',
+	source text NOT NULL DEFAULT '',
+	is_quarterly boolean NOT NULL DEFAULT false,
+	tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
+	created_at timestamptz NOT NULL DEFAULT now(),
+	updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS rag_chunks_lookup
+	ON rag_chunks (company_id, segment);
+CREATE INDEX IF NOT EXISTS rag_chunks_vector
+	ON rag_chunks USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS rag_chunks_lexical
+	ON rag_chunks USING gin (tsv);
+
+ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS period text NOT NULL DEFAULT '';
+ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '';
+ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS is_quarterly boolean NOT NULL DEFAULT false;
+`
+
+const rerankCacheSchema = `
+DROP TABLE IF EXISTS rerank_cache;
+CREATE TABLE IF NOT EXISTS rerank_score_cache (
+	key text PRIMARY KEY,
+	score real NOT NULL,
+	created_at timestamptz NOT NULL DEFAULT now()
+);
 `
 
 // Migrate creates the schema if it does not exist yet.
@@ -247,6 +309,13 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.Pool.Exec(ctx, schema); err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
 	}
+	if _, err := s.Pool.Exec(ctx, fmt.Sprintf(ragChunksSchema, s.embedDim)); err != nil {
+		return fmt.Errorf("store: migrate rag_chunks: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, rerankCacheSchema); err != nil {
+		return fmt.Errorf("store: migrate rerank_cache: %w", err)
+	}
+
 	for _, table := range tickerSectionTables() {
 		stmt := fmt.Sprintf(tickerSectionSchema, table)
 		if _, err := s.Pool.Exec(ctx, stmt); err != nil {
