@@ -2,6 +2,7 @@ package rag
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -47,6 +48,8 @@ type Indexer struct {
 	dim   int
 	rer   *llm.Reranker
 	pool  int
+
+	budgetLogged bool // the budget-exhausted note is logged once per indexer
 }
 
 // NewIndexer builds an indexer. model and dim are recorded on every row so
@@ -161,6 +164,13 @@ func (ix *Indexer) rerank(ctx context.Context, query string, hits []models.RAGHi
 	}
 	scores, err := ix.rer.Rerank(ctx, query, docs)
 	if err != nil {
+		if errors.Is(err, llm.ErrRerankBudget) {
+			if !ix.budgetLogged {
+				ix.budgetLogged = true
+				log.Printf("rag: rerank budget exhausted, keeping RRF order")
+			}
+			return hits[:topK], nil
+		}
 		log.Printf("rag: rerank failed, keeping RRF order: %v", err)
 		return hits[:topK], nil
 	}

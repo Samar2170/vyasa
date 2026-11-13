@@ -112,8 +112,9 @@ func main() {
 		symbol := fs.String("symbol", "", "optional symbol filter")
 		out := fs.String("out", "", "optional path for per-item results JSONL")
 		rerank := fs.Bool("rerank", true, "use the cross-encoder reranker (-rerank=false to disable)")
+		budget := fs.Int("rerank-budget", settings.RerankBudget, "max cache-miss rerank pairs this run may bill (0 = unlimited)")
 		_ = fs.Parse(os.Args[2:])
-		runRAGEval(ctx, st, settings, *dataset, *k, *strict, *symbol, *out, *rerank)
+		runRAGEval(ctx, st, settings, *dataset, *k, *strict, *symbol, *out, *rerank, *budget)
 	default:
 		usage()
 	}
@@ -142,7 +143,7 @@ commands:
   rag-eval replay a golden dataset through hybrid search and score
             Hit@k/Recall/MRR/nDCG: [-dataset dataset/rag_golden.jsonl]
             [-k 1,3,5,8,10] [-strict] [-symbol RELIANCE] [-out results.jsonl]
-            [-rerank=false]`)
+            [-rerank=false] [-rerank-budget 2000]`)
 	os.Exit(2)
 }
 
@@ -363,8 +364,9 @@ func providerOrder(s string) []string {
 
 // mustReranker builds the cross-encoder rerank client from the provider API
 // key and the rerank_model / rerank_pool settings, backed by a persistent
-// Postgres rerank-score cache. Returns nil when rerank_enabled is false.
-func mustReranker(ctx context.Context, st *store.Store, settings config.Settings) *llm.Reranker {
+// Postgres rerank-score cache. budget (nil = uncapped) limits the cache-miss
+// pairs the API may bill. Returns nil when rerank_enabled is false.
+func mustReranker(ctx context.Context, st *store.Store, settings config.Settings, budget *llm.RerankBudget) *llm.Reranker {
 	if !settings.RerankOn() {
 		return nil
 	}
@@ -376,7 +378,7 @@ func mustReranker(ctx context.Context, st *store.Store, settings config.Settings
 		APIKey:     apiKey,
 		MaxRetries: settings.MaxRetries,
 		Timeout:    settings.Timeout(),
-	}, settings.RerankModel).WithCache(st)
+	}, settings.RerankModel).WithCache(st).WithBudget(budget)
 }
 
 // runRAGIndex indexes archived filings: for every pending resource it
@@ -526,7 +528,7 @@ func orDash(s string) string {
 func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings, symbol, segment, query string, k int, rerank bool) {
 	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
 	if rerank {
-		ix = ix.WithReranker(mustReranker(ctx, st, settings), settings.RerankPool)
+		ix = ix.WithReranker(mustReranker(ctx, st, settings, nil), settings.RerankPool)
 	}
 	co, err := st.GetCompany(ctx, symbol)
 	if err != nil {
@@ -584,8 +586,9 @@ func runRAGEvalGen(ctx context.Context, st *store.Store, settings config.Setting
 // runRAGEval replays the golden dataset through the production hybrid search
 // and prints Hit@k / Recall@k / MRR / nDCG, overall and broken down by
 // segment and symbol. With rerank on, the cross-encoder reorders the
-// candidate pool before truncation.
-func runRAGEval(ctx context.Context, st *store.Store, settings config.Settings, dataset, ks string, strict bool, symbol, out string, rerank bool) {
+// candidate pool before truncation; budgetPairs > 0 caps the cache-miss
+// pairs the sweep may bill, with pool-over-budget items keeping RRF order.
+func runRAGEval(ctx context.Context, st *store.Store, settings config.Settings, dataset, ks string, strict bool, symbol, out string, rerank bool, budgetPairs int) {
 	items, err := eval.LoadJSONL(dataset)
 	if err != nil {
 		log.Fatalf("rag-eval: %v", err)
@@ -594,9 +597,13 @@ func runRAGEval(ctx context.Context, st *store.Store, settings config.Settings, 
 	if err != nil {
 		log.Fatalf("rag-eval: %v", err)
 	}
+	var budget *llm.RerankBudget
+	if budgetPairs > 0 {
+		budget = llm.NewRerankBudget(budgetPairs)
+	}
 	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
 	if rerank {
-		ix = ix.WithReranker(mustReranker(ctx, st, settings), settings.RerankPool)
+		ix = ix.WithReranker(mustReranker(ctx, st, settings, budget), settings.RerankPool)
 	}
 
 	opts := eval.RunOptions{Ks: cutoffs, Window: 1, Segment: ""}
@@ -611,6 +618,10 @@ func runRAGEval(ctx context.Context, st *store.Store, settings config.Settings, 
 		log.Fatalf("rag-eval: %v", err)
 	}
 	rep.Print(os.Stdout)
+	if budget != nil {
+		log.Printf("[rag-eval] rerank budget: spent %d pairs, %d pools skipped, %d/%d left",
+			budget.Spent(), budget.Skipped(), budget.Left(), budgetPairs)
+	}
 	if out != "" {
 		if err := rep.SaveResults(out); err != nil {
 			log.Fatalf("rag-eval: %v", err)

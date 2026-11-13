@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -23,6 +24,79 @@ const (
 // rerankNoRetries is assigned to Config.MaxRetries: see NewReranker.
 var rerankNoRetries = 0
 
+// ErrRerankBudget is returned by Rerank when the attached RerankBudget has
+// no room left for a pool's uncached pairs. Callers treat it exactly like
+// any rerank failure: keep the retrieval order.
+var ErrRerankBudget = errors.New("llm: rerank budget exhausted")
+
+// RerankBudget caps how many uncached (query, document) pairs one process
+// may bill through a Reranker. Cached pairs are free and never consume the
+// budget; a pool is charged atomically — when its uncached pairs do not fit
+// what is left, the whole call is refused (ErrRerankBudget) and the pool
+// keeps retrieval order. One pair is roughly 285 API-billed tokens (a
+// document trimmed to 800 runes plus query plus the instruction template),
+// so pair budgets map directly onto the endpoint's token bill.
+type RerankBudget struct {
+	mu      sync.Mutex
+	left    int
+	spent   int
+	skipped int // pools refused for lack of budget
+}
+
+// NewRerankBudget builds a budget of pairs pair-units.
+func NewRerankBudget(pairs int) *RerankBudget {
+	return &RerankBudget{left: pairs}
+}
+
+// trySpend charges n pair-units, reporting whether they fit. Callers refund
+// when the API call that consumed them fails.
+func (b *RerankBudget) trySpend(n int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n > b.left {
+		return false
+	}
+	b.left -= n
+	b.spent += n
+	return true
+}
+
+// refund returns n charged pair-units to the budget.
+func (b *RerankBudget) refund(n int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.left += n
+	b.spent -= n
+}
+
+// bumpSkipped counts one pool refused for lack of budget.
+func (b *RerankBudget) bumpSkipped() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.skipped++
+}
+
+// Spent returns the pair-units charged so far.
+func (b *RerankBudget) Spent() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.spent
+}
+
+// Left returns the unspent pair-units.
+func (b *RerankBudget) Left() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.left
+}
+
+// Skipped returns how many pools were refused for lack of budget.
+func (b *RerankBudget) Skipped() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.skipped
+}
+
 // Reranker scores query-document pairs with a cross-encoder rerank model
 // (the OpenRouter /rerank endpoint) so a deep candidate pool can be
 // reordered by relevance before truncation. Scores are cached per
@@ -35,6 +109,7 @@ type Reranker struct {
 	baseURL   string
 	model     string
 	disk      RerankCache
+	budget    *RerankBudget
 
 	mu    sync.Mutex
 	cache map[string]float64
@@ -100,11 +175,23 @@ func (r *Reranker) WithCache(c RerankCache) *Reranker {
 	return r
 }
 
+// WithBudget attaches a pair budget: Rerank charges it for the pool's
+// uncached pairs and fails with ErrRerankBudget when they do not fit. Nil
+// (default) means uncapped.
+func (r *Reranker) WithBudget(b *RerankBudget) *Reranker {
+	if r != nil {
+		r.budget = b
+	}
+	return r
+}
+
 // Rerank scores every document against the query. Every input document gets
 // exactly one score at its input index. Scores are served from the
 // in-memory pair cache, then the persistent cache, then the API — a pair
 // scored once is never billed again, so reordering or subsetting the same
-// pool costs nothing.
+// pool costs nothing. With a budget attached, only the uncached pairs are
+// charged, and a pool whose uncached pairs exceed the remaining budget is
+// refused wholesale (ErrRerankBudget) instead of being partially scored.
 func (r *Reranker) Rerank(ctx context.Context, query string, docs []string) ([]RerankHit, error) {
 	if len(docs) == 0 {
 		return nil, nil
@@ -151,6 +238,11 @@ func (r *Reranker) Rerank(ctx context.Context, query string, docs []string) ([]R
 		missing = still
 	}
 
+	if r.budget != nil && len(missing) > 0 && !r.budget.trySpend(len(missing)) {
+		r.budget.bumpSkipped()
+		return nil, ErrRerankBudget
+	}
+
 	for start := 0; start < len(missing); start += rerankBatchSize {
 		end := start + rerankBatchSize
 		if end > len(missing) {
@@ -163,6 +255,9 @@ func (r *Reranker) Rerank(ctx context.Context, query string, docs []string) ([]R
 		}
 		scores, err := r.rerankBatch(ctx, query, batchDocs)
 		if err != nil {
+			if r.budget != nil {
+				r.budget.refund(len(batch))
+			}
 			return nil, err
 		}
 		for j, sc := range scores {

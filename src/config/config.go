@@ -66,6 +66,13 @@ type Settings struct {
 	RerankPool int `json:"rerank_pool"`
 	// RerankEnabled toggles the cross-encoder reranker. Nil means enabled.
 	RerankEnabled *bool `json:"rerank_enabled"`
+	// RerankBudget caps the cache-miss (query, document) pairs one run may
+	// bill through the rerank API; 0 means unlimited. Cached pairs are free
+	// and never consume it. One pair is ~285 API tokens (a document trimmed
+	// to 800 runes + query + the instruction template), so a 62-item eval
+	// sweep at pool 32 is ~2,000 pairs; repeat runs spend nothing because
+	// every scored pair is cached.
+	RerankBudget int `json:"rerank_budget"`
 }
 
 const (
