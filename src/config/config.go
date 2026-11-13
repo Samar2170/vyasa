@@ -54,6 +54,18 @@ type Settings struct {
 
 	EmbeddingModel string `json:"embedding_model"`
 	EmbeddingDim   int    `json:"embedding_dim"`
+	// EmbeddingProvider pins the OpenRouter upstream routing for /embeddings
+	// (a JSON "order" list, e.g. ["Azure"]). Empty means OpenRouter's default
+	// routing, whose embeddings are not reproducible across calls.
+	EmbeddingProvider string `json:"embedding_provider"`
+
+	// RerankModel is the cross-encoder reranker (OpenRouter /rerank) that
+	// reorders the hybrid retrieval pool before truncation to topK.
+	RerankModel string `json:"rerank_model"`
+	// RerankPool is the number of hybrid candidates fetched before reranking.
+	RerankPool int `json:"rerank_pool"`
+	// RerankEnabled toggles the cross-encoder reranker. Nil means enabled.
+	RerankEnabled *bool `json:"rerank_enabled"`
 }
 
 const (
@@ -63,6 +75,12 @@ const (
 
 	DefaultEmbeddingModel = "openai/text-embedding-3-small"
 	DefaultEmbeddingDim   = 1536
+
+	DefaultRerankModel = "qwen/qwen3-reranker-8b"
+	// DefaultRerankPool is 4x a typical topK: deep enough for the
+	// cross-encoder to reorder, shallow enough to keep the per-search rerank
+	// token bill (template + query repeated per document) small.
+	DefaultRerankPool = 32
 )
 
 // Timeout returns the configured timeout as a duration.
@@ -95,6 +113,18 @@ func (s *Settings) withDefaults() {
 	if s.EmbeddingDim <= 0 {
 		s.EmbeddingDim = DefaultEmbeddingDim
 	}
+	if s.RerankModel == "" {
+		s.RerankModel = DefaultRerankModel
+	}
+	if s.RerankPool <= 0 {
+		s.RerankPool = DefaultRerankPool
+	}
+}
+
+// RerankOn reports whether the cross-encoder reranker should run
+// (nil rerank_enabled means enabled).
+func (s Settings) RerankOn() bool {
+	return s.RerankEnabled == nil || *s.RerankEnabled
 }
 
 // Load reads the JSON settings file at path and applies defaults. An empty

@@ -98,8 +98,12 @@ func (t *SearchTool) Execute(ctx context.Context, args string) types.ExecutionOu
 		if h.Section != "" {
 			section = " — " + h.Section
 		}
-		fmt.Fprintf(&b, "[%d] score %.4f — %s %s%s\n%s\nsource: %s\n\n",
-			i+1, h.Score, h.Symbol, label, section, h.Text, h.DocumentURL)
+		score := fmt.Sprintf("score %.4f", h.Score)
+		if h.Reranked {
+			score = fmt.Sprintf("rerank %.4f (rrf %.4f)", h.RerankScore, h.Score)
+		}
+		fmt.Fprintf(&b, "[%d] %s — %s %s%s\n%s\nsource: %s\n\n",
+			i+1, score, h.Symbol, label, section, h.Text, h.DocumentURL)
 	}
 	return types.ExecutionOutput{
 		Output:   strings.TrimSpace(b.String()),

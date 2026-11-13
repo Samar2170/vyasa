@@ -17,6 +17,7 @@ type Embedder struct {
 	baseURL   string
 	model     string
 	dim       int
+	provider  *embedRouting
 }
 
 func NewEmbedder(cfg Config, model string, dim int) *Embedder {
@@ -32,14 +33,32 @@ func NewEmbedder(cfg Config, model string, dim int) *Embedder {
 		dim:       dim,
 	}
 }
+
+// WithProvider pins OpenRouter's upstream routing (e.g. {"order":
+// ["Azure"], "allow_fallbacks": false}). Embeddings from different upstreams
+// are not bit-identical, so an unpinned model makes every query vector jitter
+// between calls — which reshuffles retrieval pools and busts caches.
+func (e *Embedder) WithProvider(order []string) *Embedder {
+	if e != nil && len(order) > 0 {
+		e.provider = &embedRouting{Order: order, AllowFallbacks: false}
+	}
+	return e
+}
+
 func (e *Embedder) Model() string { return e.model }
 
 // Dim returns the expected embedding dimension.
 func (e *Embedder) Dim() int { return e.dim }
 
+type embedRouting struct {
+	Order          []string `json:"order"`
+	AllowFallbacks bool     `json:"allow_fallbacks"`
+}
+
 type embedRequest struct {
-	Model string   `json:"model"`
-	Input []string `json:"input"`
+	Model    string        `json:"model"`
+	Input    []string      `json:"input"`
+	Provider *embedRouting `json:"provider,omitempty"`
 }
 
 type embedData struct {
@@ -75,7 +94,7 @@ func (e *Embedder) embedBatch(ctx context.Context, batch []string) ([][]float32,
 	headers := map[string]string{"Authorization": "Bearer " + e.transport.cfg.APIKey}
 	var resp embedResponse
 	if err := e.transport.DoJSON(ctx, http.MethodPost, e.baseURL+"/embeddings", headers,
-		embedRequest{Model: e.model, Input: batch}, &resp); err != nil {
+		embedRequest{Model: e.model, Input: batch, Provider: e.provider}, &resp); err != nil {
 		return nil, fmt.Errorf("llm: embed %s: %w", e.model, err)
 	}
 

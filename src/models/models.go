@@ -101,5 +101,10 @@ type RAGChunk struct {
 
 type RAGHit struct {
 	RAGChunk
+	// Score is the Reciprocal Rank Fusion score of the hybrid retrieval.
 	Score float64 `json:"score"`
+	// RerankScore is the cross-encoder relevance score when the hit has been
+	// reranked; Reranked marks that.
+	RerankScore float64 `json:"rerank_score,omitempty"`
+	Reranked    bool    `json:"reranked,omitempty"`
 }

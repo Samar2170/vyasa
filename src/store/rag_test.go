@@ -28,6 +28,27 @@ func TestFuseRRF(t *testing.T) {
 	}
 }
 
+func TestFuseRRFTiesAreDeterministic(t *testing.T) {
+	// a and c each appear once, at the same rank of different lists: both
+	// score exactly 1/(rrfK+2), so the tail order is decided by the tie-break.
+	vec := []models.RAGChunk{chunk("z"), chunk("a")}
+	lex := []models.RAGChunk{chunk("y"), chunk("c")}
+
+	first := FuseRRF(vec, lex, 4)
+	for i := 0; i < 200; i++ {
+		again := FuseRRF(vec, lex, 4)
+		for j := range first {
+			if first[j].ID != again[j].ID {
+				t.Fatalf("tie order unstable across runs: run %d pos %d gave %s, want %s",
+					i, j, again[j].ID, first[j].ID)
+			}
+		}
+	}
+	if first[2].ID != "a" || first[3].ID != "c" {
+		t.Errorf("tail = %s,%s, want a,c (id order)", first[2].ID, first[3].ID)
+	}
+}
+
 func TestFuseRRFTruncates(t *testing.T) {
 	var vec []models.RAGChunk
 	for i := 0; i < 10; i++ {

@@ -295,6 +295,15 @@ ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '';
 ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS is_quarterly boolean NOT NULL DEFAULT false;
 `
 
+const rerankCacheSchema = `
+DROP TABLE IF EXISTS rerank_cache;
+CREATE TABLE IF NOT EXISTS rerank_score_cache (
+	key text PRIMARY KEY,
+	score real NOT NULL,
+	created_at timestamptz NOT NULL DEFAULT now()
+);
+`
+
 // Migrate creates the schema if it does not exist yet.
 func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.Pool.Exec(ctx, schema); err != nil {
@@ -302,6 +311,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.Pool.Exec(ctx, fmt.Sprintf(ragChunksSchema, s.embedDim)); err != nil {
 		return fmt.Errorf("store: migrate rag_chunks: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, rerankCacheSchema); err != nil {
+		return fmt.Errorf("store: migrate rerank_cache: %w", err)
 	}
 
 	for _, table := range tickerSectionTables() {

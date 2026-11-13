@@ -88,8 +88,8 @@ func (s *Store) SearchRAGLexical(ctx context.Context, companyID, segment, query 
 		FROM rag_chunks, websearch_to_tsquery('english', $3) AS query
 		WHERE rag_chunks.tsv @@ query
 		  AND ($1 = '' OR company_id = $1) AND ($2 = '' OR segment = $2)
-		ORDER BY score DESC
-		LIMIT $4`, companyID, segment, query, topK)
+	ORDER BY score DESC, id
+	LIMIT $4`, companyID, segment, query, topK)
 	if err != nil {
 		return nil, fmt.Errorf("store: lexical search: %w", err)
 	}
@@ -123,15 +123,17 @@ func collectRAGChunks(rows pgx.Rows) ([]models.RAGChunk, error) {
 
 // SearchRAGHybrid runs semantic vector search and lexical full-text search,
 // fuses both rankings with Reciprocal Rank Fusion and returns the top-k
-// chunks. Either signal alone degrades gracefully.
-func (s *Store) SearchRAGHybrid(ctx context.Context, companyID, segment, query string, qvec []float32, topK int) ([]models.RAGHit, error) {
+// chunks. Either signal alone degrades gracefully. poolSize is the number of
+// candidates fetched before truncation (>= topK, so a reranker can reorder
+// a deeper pool than the final result count).
+func (s *Store) SearchRAGHybrid(ctx context.Context, companyID, segment, query string, qvec []float32, topK, poolSize int) ([]models.RAGHit, error) {
 	if topK <= 0 {
 		topK = 8
 	}
-	candidates := topK * 5
-	if candidates < 50 {
-		candidates = 50
+	if poolSize < topK {
+		poolSize = topK
 	}
+	candidates := poolSize
 
 	var vecHits, lexHits []models.RAGChunk
 	if len(qvec) > 0 {
@@ -151,7 +153,7 @@ func (s *Store) SearchRAGHybrid(ctx context.Context, companyID, segment, query s
 	if vecHits == nil && lexHits == nil {
 		return nil, fmt.Errorf("store: hybrid search needs a query and/or a query vector")
 	}
-	return FuseRRF(vecHits, lexHits, topK), nil
+	return FuseRRF(vecHits, lexHits, poolSize), nil
 }
 
 // FuseRRF merges the vector and lexical rankings with Reciprocal Rank
@@ -174,7 +176,24 @@ func FuseRRF(vecHits, lexHits []models.RAGChunk, topK int) []models.RAGHit {
 	for id, sc := range scores {
 		out = append(out, models.RAGHit{RAGChunk: byID[id], Score: sc})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
+	// Equal RRF scores are frequent (e.g. two docs each appearing once at the
+	// same rank of the two lists), so the tie-break must be total and
+	// deterministic: identical candidate sets must fuse to an identical order,
+	// or the rerank cache key changes run to run and the same pool gets
+	// re-billed at the API.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Score != out[j].Score {
+			return out[i].Score > out[j].Score
+		}
+		a, b := out[i].RAGChunk, out[j].RAGChunk
+		if a.DocumentURL != b.DocumentURL {
+			return a.DocumentURL < b.DocumentURL
+		}
+		if a.Ordinal != b.Ordinal {
+			return a.Ordinal < b.Ordinal
+		}
+		return a.ID < b.ID
+	})
 	if len(out) > topK {
 		out = out[:topK]
 	}

@@ -51,8 +51,9 @@ type Searcher interface {
 }
 
 // Run replays every dataset item through the searcher and scores retrieval.
-// Each item costs exactly one hybrid search (topK = max k, whose candidate
-// pool is >= 50), so every requested cutoff is scored from the same ranking.
+// Each item costs exactly one hybrid search (topK = max k, with the rerank
+// candidate pool as the truncation ceiling), so every requested cutoff is
+// scored from the same ranking.
 func Run(ctx context.Context, ix Searcher, st *store.Store, items []Item, opts RunOptions) (*Report, error) {
 	rep := &Report{
 		Ks:             opts.Ks,

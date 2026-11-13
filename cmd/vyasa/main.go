@@ -91,11 +91,12 @@ func main() {
 		query := fs.String("query", "", "search query")
 		segment := fs.String("segment", "", "optional segment filter (annual_report, investor_presentation, earnings_call_transcript, quarterly_financials)")
 		k := fs.Int("k", 8, "max hits")
+		rerank := fs.Bool("rerank", true, "use the cross-encoder reranker (-rerank=false to disable)")
 		_ = fs.Parse(os.Args[2:])
 		if *symbol == "" || *query == "" {
 			log.Fatal("rag-search requires -symbol SYMBOL and -query QUERY")
 		}
-		runRAGSearch(ctx, st, settings, *symbol, *segment, *query, *k)
+		runRAGSearch(ctx, st, settings, *symbol, *segment, *query, *k, *rerank)
 	case "rag-eval-gen":
 		fs := flag.NewFlagSet("rag-eval-gen", flag.ExitOnError)
 		symbols := fs.String("symbol", "", "comma-separated symbols to sample (default: every indexed symbol)")
@@ -110,8 +111,9 @@ func main() {
 		strict := fs.Bool("strict", false, "score exact ordinals only (no +-1 neighbour tolerance)")
 		symbol := fs.String("symbol", "", "optional symbol filter")
 		out := fs.String("out", "", "optional path for per-item results JSONL")
+		rerank := fs.Bool("rerank", true, "use the cross-encoder reranker (-rerank=false to disable)")
 		_ = fs.Parse(os.Args[2:])
-		runRAGEval(ctx, st, settings, *dataset, *k, *strict, *symbol, *out)
+		runRAGEval(ctx, st, settings, *dataset, *k, *strict, *symbol, *out, *rerank)
 	default:
 		usage()
 	}
@@ -131,14 +133,16 @@ commands:
             presentation, transcript, quarterly financials): -symbol RELIANCE
   rag-index index archived filings (chunk, embed, store): [-force] re-index
             even already-indexed investor-relations filings
-  rag-search hybrid semantic+keyword search over indexed filings:
-            -symbol RELIANCE -query "capex guidance" [-segment ...] [-k 8]
+  rag-search hybrid semantic+keyword search over indexed filings, reranked
+            by a cross-encoder: -symbol RELIANCE -query "capex guidance"
+            [-segment ...] [-k 8] [-rerank=false]
   rag-eval-gen draft a retrieval-eval golden dataset from indexed chunks:
             [-symbol CSV] [-n 60] [-out dataset/rag_golden.jsonl] (review the
             draft by hand before running rag-eval on it)
   rag-eval replay a golden dataset through hybrid search and score
             Hit@k/Recall/MRR/nDCG: [-dataset dataset/rag_golden.jsonl]
-            [-k 1,3,5,8,10] [-strict] [-symbol RELIANCE] [-out results.jsonl]`)
+            [-k 1,3,5,8,10] [-strict] [-symbol RELIANCE] [-out results.jsonl]
+            [-rerank=false]`)
 	os.Exit(2)
 }
 
@@ -337,7 +341,42 @@ func mustEmbedder(settings config.Settings) *llm.Embedder {
 		APIKey:     apiKey,
 		MaxRetries: settings.MaxRetries,
 		Timeout:    settings.Timeout(),
-	}, settings.EmbeddingModel, settings.EmbeddingDim)
+	}, settings.EmbeddingModel, settings.EmbeddingDim).
+		WithProvider(providerOrder(settings.EmbeddingProvider))
+}
+
+// providerOrder splits a comma-separated OpenRouter provider routing order
+// (nil when empty) for the embeddings "provider" request field.
+func providerOrder(s string) []string {
+	parts := strings.Split(s, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// mustReranker builds the cross-encoder rerank client from the provider API
+// key and the rerank_model / rerank_pool settings, backed by a persistent
+// Postgres rerank-score cache. Returns nil when rerank_enabled is false.
+func mustReranker(ctx context.Context, st *store.Store, settings config.Settings) *llm.Reranker {
+	if !settings.RerankOn() {
+		return nil
+	}
+	apiKey, err := config.RequireSecret(strings.ToUpper(settings.Provider) + "_API_KEY")
+	if err != nil {
+		log.Fatal(err)
+	}
+	return llm.NewReranker(llm.Config{
+		APIKey:     apiKey,
+		MaxRetries: settings.MaxRetries,
+		Timeout:    settings.Timeout(),
+	}, settings.RerankModel).WithCache(st)
 }
 
 // runRAGIndex indexes archived filings: for every pending resource it
@@ -482,9 +521,13 @@ func orDash(s string) string {
 }
 
 // runRAGSearch runs a hybrid search over one company's indexed filings and
-// prints the ranked chunks.
-func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings, symbol, segment, query string, k int) {
+// prints the ranked chunks. With rerank on, the cross-encoder reorders a
+// deep candidate pool before truncation.
+func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings, symbol, segment, query string, k int, rerank bool) {
 	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+	if rerank {
+		ix = ix.WithReranker(mustReranker(ctx, st, settings), settings.RerankPool)
+	}
 	co, err := st.GetCompany(ctx, symbol)
 	if err != nil {
 		log.Fatalf("rag-search: %v", err)
@@ -512,8 +555,12 @@ func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings
 		if h.Section != "" {
 			section = " — " + h.Section
 		}
-		fmt.Printf("[%d] score %.4f — %s %s%s\n%s\nsource: %s\n\n",
-			i+1, h.Score, h.Symbol, label, section, h.Text, h.DocumentURL)
+		score := fmt.Sprintf("score %.4f", h.Score)
+		if h.Reranked {
+			score = fmt.Sprintf("rerank %.4f (rrf %.4f)", h.RerankScore, h.Score)
+		}
+		fmt.Printf("[%d] %s — %s %s%s\n%s\nsource: %s\n\n",
+			i+1, score, h.Symbol, label, section, h.Text, h.DocumentURL)
 	}
 }
 
@@ -536,8 +583,9 @@ func runRAGEvalGen(ctx context.Context, st *store.Store, settings config.Setting
 
 // runRAGEval replays the golden dataset through the production hybrid search
 // and prints Hit@k / Recall@k / MRR / nDCG, overall and broken down by
-// segment and symbol.
-func runRAGEval(ctx context.Context, st *store.Store, settings config.Settings, dataset, ks string, strict bool, symbol, out string) {
+// segment and symbol. With rerank on, the cross-encoder reorders the
+// candidate pool before truncation.
+func runRAGEval(ctx context.Context, st *store.Store, settings config.Settings, dataset, ks string, strict bool, symbol, out string, rerank bool) {
 	items, err := eval.LoadJSONL(dataset)
 	if err != nil {
 		log.Fatalf("rag-eval: %v", err)
@@ -547,6 +595,9 @@ func runRAGEval(ctx context.Context, st *store.Store, settings config.Settings, 
 		log.Fatalf("rag-eval: %v", err)
 	}
 	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+	if rerank {
+		ix = ix.WithReranker(mustReranker(ctx, st, settings), settings.RerankPool)
+	}
 
 	opts := eval.RunOptions{Ks: cutoffs, Window: 1, Segment: ""}
 	if strict {
