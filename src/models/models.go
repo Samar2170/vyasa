@@ -14,7 +14,13 @@ const (
 
 	TableDocumentChunks = "document_chunks"
 	TableRAGChunks      = "rag_chunks"
+	TableRAGTables      = "rag_tables"
 )
+
+// HitKindTable marks a RAGHit that was retrieved from the rag_tables store
+// rather than the prose rag_chunks store. Any other Kind (including empty)
+// is a prose chunk.
+const HitKindTable = "table"
 
 // BaseModel carries the columns shared by every table.
 type BaseModel struct {
@@ -95,8 +101,43 @@ type RAGChunk struct {
 	Period string `json:"period,omitempty"`
 	// Source is the original source of the document, e.g. "tickertape" or
 	// "investor_relations".
-	Source      string `json:"source,omitempty"`
-	IsQuarterly bool   `json:"is_quarterly,omitempty"`
+	Source string `json:"source,omitempty"`
+	IsQuarterly bool `json:"is_quarterly,omitempty"`
+	// Kind marks prose ("", never stored) vs table hits retrieved from the
+	// separate rag_tables store and merged into the same result list.
+	Kind string `json:"kind,omitempty"`
+}
+
+// TableGrid is the raw cell grid of an extracted table, stored as jsonb so
+// downstream consumers get the numbers back without re-parsing markdown.
+type TableGrid struct {
+	Header []string   `json:"header,omitempty"`
+	Rows   [][]string `json:"rows"`
+}
+
+// RAGTable is one extracted financial table indexed for retrieval. Text
+// carries the serialized (markdown) form that is embedded and lexically
+// searched; Content keeps the raw grid. One row per table.
+type RAGTable struct {
+	BaseModel
+	CompanyID   string    `json:"company_id"`
+	Symbol      string    `json:"symbol"`
+	Segment     string    `json:"segment"`
+	DocumentURL string    `json:"document_url"`
+	Ordinal     int       `json:"ordinal"`
+	Page        int       `json:"page"`
+	Caption     string    `json:"caption"`
+	NRows       int       `json:"n_rows"`
+	NCols       int       `json:"n_cols"`
+	Content     TableGrid `json:"content,omitempty"`
+	Text        string    `json:"text"`
+	Model       string    `json:"model"`
+	Embedding   []float32 `json:"embedding"`
+
+	Period string `json:"period,omitempty"`
+	Source string `json:"source,omitempty"`
+	// IsQuarterly mirrors the parent document's quarterly flag.
+	IsQuarterly bool `json:"is_quarterly,omitempty"`
 }
 
 type RAGHit struct {

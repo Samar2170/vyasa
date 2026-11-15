@@ -122,8 +122,9 @@ func (ix *Indexer) IndexDocument(ctx context.Context, co models.Company, meta Do
 	return len(rows), nil
 }
 
-// Search embeds the query and runs the hybrid retrieval, reranked by the
-// cross-encoder when one is attached.
+// Search embeds the query and runs the hybrid retrieval over the prose
+// chunks, reranked by the cross-encoder when one is attached. Tables are a
+// separate surface: see SearchTables and the rag_table_search tool.
 func (ix *Indexer) Search(ctx context.Context, companyID, segment, query string, topK int) ([]models.RAGHit, error) {
 	if ix == nil || ix.st == nil {
 		return nil, fmt.Errorf("rag: indexer not configured")

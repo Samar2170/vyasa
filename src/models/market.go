@@ -128,3 +128,34 @@ type TickerMetrics struct {
 	FCFToPAT    *float64 `json:"fcf_to_pat,omitempty"`
 	CFOToEBITDA *float64 `json:"cfo_to_ebitda,omitempty"`
 }
+
+// TickerMetricColumns lists the metric columns of ticker_metrics in schema
+// order. It is the single source of truth for scanning full metric rows and
+// for validating agent-supplied metric names (tools.go in package metrics).
+var TickerMetricColumns = []string{
+	"total_revenue", "gross_profit", "ebitda", "ebit", "pbt", "net_income", "eps",
+	"cfo", "capex", "fcf",
+	"total_equity", "minority_interest", "net_worth", "total_debt", "cash_and_sti",
+	"total_assets", "current_assets", "current_liabilities",
+	"receivables", "inventory", "payables", "shares_outstanding",
+
+	"revenue_yoy", "revenue_cagr_3y", "revenue_cagr_5y",
+	"ebitda_yoy", "ebitda_cagr_3y", "ebitda_cagr_5y",
+	"ebit_yoy", "ebit_cagr_3y", "ebit_cagr_5y",
+	"pat_yoy", "pat_cagr_3y", "pat_cagr_5y",
+	"eps_yoy", "eps_cagr_3y", "eps_cagr_5y",
+
+	"dol_ebit", "dol_ebitda",
+	"gross_margin", "ebitda_margin", "ebit_margin", "net_margin",
+
+	"roe", "ronw", "roce", "roic",
+
+	"debt_to_equity", "net_debt", "net_debt_to_ebitda", "interest_coverage", "current_ratio",
+
+	"dso_days", "dio_days", "dpo_days", "wc_cycle_days",
+	"receivables_yoy", "receivables_pct_revenue",
+	"inventory_yoy", "inventory_pct_revenue",
+	"payables_yoy", "payables_pct_cogs",
+
+	"fcf_margin", "cfo_to_pat", "fcf_to_pat", "cfo_to_ebitda",
+}

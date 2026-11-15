@@ -14,7 +14,9 @@ import (
 
 const rrfK = 60
 
-func vectorLiteral(vec []float32) string {
+// VectorLiteral renders a float32 vector as the text form pgvector accepts
+// in casts like $3::vector.
+func VectorLiteral(vec []float32) string {
 	var b strings.Builder
 	b.WriteByte('[')
 	for i, v := range vec {
@@ -50,7 +52,7 @@ func (s *Store) InsertRAGChunks(ctx context.Context, chunks []models.RAGChunk) e
 				(company_id, symbol, segment, document_url, ordinal, "offset", section, text, embedding, model, period, source, is_quarterly, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::vector, $10, $11, $12, $13, $14, $14)`,
 			c.CompanyID, c.Symbol, c.Segment, c.DocumentURL, c.Ordinal, c.Offset,
-			c.Section, c.Text, vectorLiteral(c.Embedding), c.Model,
+			c.Section, c.Text, VectorLiteral(c.Embedding), c.Model,
 			c.Period, c.Source, c.IsQuarterly, now)
 	}
 	if err := s.Pool.SendBatch(ctx, b).Close(); err != nil {
@@ -137,7 +139,7 @@ func (s *Store) SearchRAGHybrid(ctx context.Context, companyID, segment, query s
 
 	var vecHits, lexHits []models.RAGChunk
 	if len(qvec) > 0 {
-		hits, err := s.SearchRAGVector(ctx, companyID, segment, vectorLiteral(qvec), candidates)
+		hits, err := s.SearchRAGVector(ctx, companyID, segment, VectorLiteral(qvec), candidates)
 		if err != nil {
 			return nil, fmt.Errorf("store: hybrid vector search: %w", err)
 		}
@@ -153,14 +155,16 @@ func (s *Store) SearchRAGHybrid(ctx context.Context, companyID, segment, query s
 	if vecHits == nil && lexHits == nil {
 		return nil, fmt.Errorf("store: hybrid search needs a query and/or a query vector")
 	}
-	return FuseRRF(vecHits, lexHits, poolSize), nil
+	return FuseRRF(poolSize, vecHits, lexHits), nil
 }
 
-// FuseRRF merges the vector and lexical rankings with Reciprocal Rank
-// Fusion, best first.
-func FuseRRF(vecHits, lexHits []models.RAGChunk, topK int) []models.RAGHit {
-	scores := make(map[string]float64, len(vecHits)+len(lexHits))
-	byID := make(map[string]models.RAGChunk, len(vecHits)+len(lexHits))
+// FuseRRF merges the candidate rankings with Reciprocal Rank Fusion, best
+// first. Any number of lists can be fused (prose vector/lexical, table
+// vector/lexical, ...): membership across lists boosts a candidate, and the
+// ranks within each list decide the boost size.
+func FuseRRF(topK int, lists ...[]models.RAGChunk) []models.RAGHit {
+	scores := make(map[string]float64)
+	byID := make(map[string]models.RAGChunk)
 	accumulate := func(hits []models.RAGChunk) {
 		for i, h := range hits {
 			scores[h.ID] += 1.0 / float64(rrfK+i+1)
@@ -169,8 +173,9 @@ func FuseRRF(vecHits, lexHits []models.RAGChunk, topK int) []models.RAGHit {
 			}
 		}
 	}
-	accumulate(vecHits)
-	accumulate(lexHits)
+	for _, hits := range lists {
+		accumulate(hits)
+	}
 
 	out := make([]models.RAGHit, 0, len(scores))
 	for id, sc := range scores {
@@ -209,6 +214,22 @@ func (s *Store) MarkResourceIndexed(ctx context.Context, companyID, segment stri
 		companyID, segment, indexed, now)
 	if err != nil {
 		return fmt.Errorf("store: mark resource indexed %s/%s: %w", companyID, segment, err)
+	}
+	return nil
+}
+
+// RecordResourceTables merges the archived tables file info into a
+// resource's extracted_data, so the JSON stays discoverable without
+// overwriting the fields other pipeline steps wrote.
+func (s *Store) RecordResourceTables(ctx context.Context, companyID, segment, name, tablesPath string, count int) error {
+	now := time.Now()
+	payload := fmt.Sprintf(`{"tables_name":%q,"tables_path":%q,"table_count":%d}`, name, tablesPath, count)
+	_, err := s.Pool.Exec(ctx, `UPDATE company_research_resources
+		SET extracted_data = COALESCE(extracted_data, '{}'::jsonb) || $3::jsonb, updated_at = $4
+		WHERE company_id = $1 AND analysis_segment = $2`,
+		companyID, segment, payload, now)
+	if err != nil {
+		return fmt.Errorf("store: record tables %s/%s: %w", companyID, segment, err)
 	}
 	return nil
 }
@@ -279,6 +300,39 @@ func (s *Store) UnindexedResources(ctx context.Context) ([]PendingResource, erro
 		ORDER BY c.symbol, r.analysis_segment`)
 	if err != nil {
 		return nil, fmt.Errorf("store: unindexed resources: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PendingResource
+	for rows.Next() {
+		var p PendingResource
+		if err := rows.Scan(&p.CompanyID, &p.Symbol, &p.AnalysisSegment, &p.Source,
+			&p.DocumentURL, &p.AnchorText, &p.RawDataUrl, &p.TextPath); err != nil {
+			return nil, fmt.Errorf("store: scan pending resource: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// TableBackfillResources returns every resource row that has an archived
+// PDF but no tables file recorded yet — the migration backlog for
+// rag_tables after filings were indexed before table extraction existed.
+// An empty symbol matches every company.
+func (s *Store) TableBackfillResources(ctx context.Context, symbol string) ([]PendingResource, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT r.company_id, c.symbol, r.analysis_segment, r.source, r.research_resource_link,
+		       COALESCE(r.extracted_data->>'anchor_text', ''),
+		       COALESCE(r.extracted_data->>'pdf_path', ''),
+		       COALESCE(r.extracted_data->>'text_path', '')
+		FROM company_research_resources r
+		JOIN companies c ON c.id = r.company_id
+		WHERE COALESCE(r.extracted_data->>'pdf_path', '') <> ''
+		  AND COALESCE(r.extracted_data->>'tables_path', '') = ''
+		  AND ($1 = '' OR c.symbol = $1)
+		ORDER BY c.symbol, r.analysis_segment`, symbol)
+	if err != nil {
+		return nil, fmt.Errorf("store: table backfill resources: %w", err)
 	}
 	defer rows.Close()
 

@@ -7,7 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"vyasa/src/models"
 )
@@ -52,6 +55,83 @@ func (s *Store) MetricsSymbols(ctx context.Context) ([]string, error) {
 		out = append(out, sym)
 	}
 	return out, rows.Err()
+}
+
+// GetMetrics returns every stored metrics row for a symbol, oldest to newest
+// FY. Tool layers slice and filter from this full series.
+func (s *Store) GetMetrics(ctx context.Context, symbol string) ([]models.TickerMetrics, error) {
+	cols := `company_id, symbol, fy, end_date, data_gaps, ` + strings.Join(models.TickerMetricColumns, ", ")
+	rows, err := s.Pool.Query(ctx,
+		`SELECT `+cols+` FROM ticker_metrics WHERE symbol = $1 ORDER BY fy`, symbol)
+	if err != nil {
+		return nil, fmt.Errorf("store: get metrics %s: %w", symbol, err)
+	}
+	defer rows.Close()
+
+	var out []models.TickerMetrics
+	for rows.Next() {
+		m, err := scanMetrics(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan metrics %s: %w", symbol, err)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// scanMetrics scans one ticker_metrics row; the destination order must match
+// the SELECT column list of GetMetrics.
+func scanMetrics(row pgx.Row) (models.TickerMetrics, error) {
+	var (
+		m      models.TickerMetrics
+		gaps   []byte
+		fields = metricFieldPtrs(&m)
+	)
+	dests := make([]any, 0, 5+len(fields))
+	dests = append(dests, &m.CompanyID, &m.Symbol, &m.FY, &m.EndDate, &gaps)
+	dests = append(dests, fields...) // **float64 targets: NULL scans to nil
+	if err := row.Scan(dests...); err != nil {
+		return m, err
+	}
+	if len(gaps) > 0 {
+		if err := json.Unmarshal(gaps, &m.DataGaps); err != nil {
+			return m, fmt.Errorf("decode data_gaps: %w", err)
+		}
+	}
+	return m, nil
+}
+
+// metricFieldPtrs returns the model's metric fields as scan destinations
+// (**float64 each) in models.TickerMetricColumns order, so NULL columns scan
+// to nil fields.
+func metricFieldPtrs(m *models.TickerMetrics) []any {
+	return []any{
+		&m.TotalRevenue, &m.GrossProfit, &m.EBITDA, &m.EBIT, &m.PBT, &m.NetIncome, &m.EPS,
+		&m.CFO, &m.Capex, &m.FCF,
+		&m.TotalEquity, &m.MinorityInterest, &m.NetWorth, &m.TotalDebt, &m.CashAndSTI,
+		&m.TotalAssets, &m.CurrentAssets, &m.CurrentLiabilities,
+		&m.Receivables, &m.Inventory, &m.Payables, &m.SharesOutstanding,
+
+		&m.RevenueYoY, &m.RevenueCAGR3Y, &m.RevenueCAGR5Y,
+		&m.EBITDAYoY, &m.EBITDACAGR3Y, &m.EBITDACAGR5Y,
+		&m.EBITYoY, &m.EBITCAGR3Y, &m.EBITCAGR5Y,
+		&m.PATYoY, &m.PATCAGR3Y, &m.PATCAGR5Y,
+		&m.EPSYoY, &m.EPSCAGR3Y, &m.EPSCAGR5Y,
+
+		&m.DOLEBIT, &m.DOLEBITDA,
+		&m.GrossMargin, &m.EBITDAMargin, &m.EBITMargin, &m.NetMargin,
+
+		&m.ROE, &m.RONW, &m.ROCE, &m.ROIC,
+
+		&m.DebtToEquity, &m.NetDebt, &m.NetDebtToEBITDA, &m.InterestCoverage, &m.CurrentRatio,
+
+		&m.DSODays, &m.DIODays, &m.DPODays, &m.WCCycleDays,
+		&m.ReceivablesYoY, &m.ReceivablesPctRev,
+		&m.InventoryYoY, &m.InventoryPctRev,
+		&m.PayablesYoY, &m.PayablesPctCOGS,
+
+		&m.FCFMargin, &m.CFOToPAT, &m.FCFToPAT, &m.CFOToEBITDA,
+	}
 }
 
 // UpsertMetrics writes the per-FY metrics rows keyed by (symbol, fy).

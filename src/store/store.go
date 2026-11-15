@@ -295,6 +295,42 @@ ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '';
 ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS is_quarterly boolean NOT NULL DEFAULT false;
 `
 
+// ragTablesSchema stores extracted financial tables as first-class retrieval
+// units, separate from the prose chunks in rag_chunks. Text carries the
+// serialized (markdown) table that is embedded and lexically searched;
+// content keeps the raw cell grid as jsonb. One row per table.
+const ragTablesSchema = `
+
+CREATE TABLE IF NOT EXISTS rag_tables (
+	id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+	company_id text NOT NULL,
+	symbol text NOT NULL DEFAULT '',
+	segment text NOT NULL DEFAULT '',
+	document_url text NOT NULL DEFAULT '',
+	ordinal integer NOT NULL DEFAULT 0,
+	page integer NOT NULL DEFAULT 0,
+	caption text NOT NULL DEFAULT '',
+	n_rows integer NOT NULL DEFAULT 0,
+	n_cols integer NOT NULL DEFAULT 0,
+	content jsonb NOT NULL DEFAULT '{}'::jsonb,
+	text text NOT NULL DEFAULT '',
+	embedding vector(%[1]d) NOT NULL,
+	model text NOT NULL DEFAULT '',
+	period text NOT NULL DEFAULT '',
+	source text NOT NULL DEFAULT '',
+	is_quarterly boolean NOT NULL DEFAULT false,
+	tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
+	created_at timestamptz NOT NULL DEFAULT now(),
+	updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS rag_tables_lookup
+	ON rag_tables (company_id, segment);
+CREATE INDEX IF NOT EXISTS rag_tables_vector
+	ON rag_tables USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS rag_tables_lexical
+	ON rag_tables USING gin (tsv);
+`
+
 const rerankCacheSchema = `
 DROP TABLE IF EXISTS rerank_cache;
 CREATE TABLE IF NOT EXISTS rerank_score_cache (
@@ -403,6 +439,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.Pool.Exec(ctx, fmt.Sprintf(ragChunksSchema, s.embedDim)); err != nil {
 		return fmt.Errorf("store: migrate rag_chunks: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, fmt.Sprintf(ragTablesSchema, s.embedDim)); err != nil {
+		return fmt.Errorf("store: migrate rag_tables: %w", err)
 	}
 	if _, err := s.Pool.Exec(ctx, rerankCacheSchema); err != nil {
 		return fmt.Errorf("store: migrate rerank_cache: %w", err)

@@ -114,12 +114,14 @@ same LLM and tool interfaces.
 │   │   └── *_test.go
 │   ├── metrics/                  # package metrics: per-FY key metrics from the annual statements
 │   │   ├── metrics.go            #   statement parsing (FY rows only, TTM dropped) + Compute: raw copies, growth/CAGR, DOL, margins, returns, solvency, working capital, cash-flow ratios; per-row data_gaps
-│   │   └── metrics_test.go       #   compute fixtures mirroring the stored statement JSON
+│   │   ├── tools.go              #   agent tools: metrics_series (multi-metric × multi-year) + metrics_snapshot (all metrics for one FY, incl. data_gaps)
+│   │   ├── metrics_test.go       #   compute fixtures mirroring the stored statement JSON
+│   │   └── tools_test.go         #   FY normalization, metric-name resolution, series/snapshot projection
 │   ├── store/                    # package store: PostgreSQL connection, schema, and all queries
 │   │   ├── store.go              #   Store: idempotent schema creation (pgx), jsonb payloads + indexed columns
 │   │   ├── tables.go             #   per-section tickertape tables (shared schema)
 │   │   ├── company.go            #   GetCompany, CreateMissingCompanies (seed path)
-│   │   ├── metrics.go            #   LatestStatement reads, MetricsSymbols listing, UpsertMetrics into ticker_metrics
+│   │   ├── metrics.go            #   LatestStatement reads, MetricsSymbols listing, UpsertMetrics + GetMetrics on ticker_metrics
 │   │   ├── rag.go                #   RAG queries: insert/delete chunks, vector + lexical search, SearchRAGHybrid + FuseRRF, MarkResourceIndexed
 │   │   ├── rerank_cache.go      #   persistent rerank-score cache (pair-hash keyed)
 │   │   └── rag_test.go
