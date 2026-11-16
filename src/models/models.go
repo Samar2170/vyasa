@@ -12,9 +12,10 @@ const (
 	TableCompanyResources = "company_research_resources"
 	TableSavedFiles       = "saved_files"
 
-	TableDocumentChunks = "document_chunks"
-	TableRAGChunks      = "rag_chunks"
-	TableRAGTables      = "rag_tables"
+	TableDocumentChunks  = "document_chunks"
+	TableRAGChunks       = "rag_chunks"
+	TableRAGTables       = "rag_tables"
+	TableResearchReports = "research_reports"
 )
 
 // HitKindTable marks a RAGHit that was retrieved from the rag_tables store
@@ -30,7 +31,6 @@ type BaseModel struct {
 }
 
 type Company struct {
-	
 	BaseModel
 	Symbol   string `json:"symbol"`
 	Exchange string `json:"exchange,omitempty"`
@@ -101,8 +101,8 @@ type RAGChunk struct {
 	Period string `json:"period,omitempty"`
 	// Source is the original source of the document, e.g. "tickertape" or
 	// "investor_relations".
-	Source string `json:"source,omitempty"`
-	IsQuarterly bool `json:"is_quarterly,omitempty"`
+	Source      string `json:"source,omitempty"`
+	IsQuarterly bool   `json:"is_quarterly,omitempty"`
 	// Kind marks prose ("", never stored) vs table hits retrieved from the
 	// separate rag_tables store and merged into the same result list.
 	Kind string `json:"kind,omitempty"`
@@ -148,4 +148,20 @@ type RAGHit struct {
 	// reranked; Reranked marks that.
 	RerankScore float64 `json:"rerank_score,omitempty"`
 	Reranked    bool    `json:"reranked,omitempty"`
+}
+
+type QAPair struct {
+	Question string `json:"question"`
+	Answer   string `json:"answer"`
+}
+
+type ResearchReport struct {
+	BaseModel
+	CompanyID    string         `json:"company_id"`
+	Symbol       string         `json:"symbol"`
+	Title        string         `json:"title"`
+	ReportMD     string         `json:"report_md"`
+	Questions    []QAPair       `json:"questions,omitempty"`
+	Usage        map[string]any `json:"usage,omitempty"`
+	ArchivedPath string         `json:"archived_path,omitempty"`
 }

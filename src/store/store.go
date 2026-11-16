@@ -432,6 +432,23 @@ CREATE TABLE IF NOT EXISTS ticker_metrics (
 );
 `
 
+const researchReportsSchema = `
+CREATE TABLE IF NOT EXISTS research_reports (
+	id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+	company_id text NOT NULL DEFAULT '',
+	symbol text NOT NULL,
+	title text NOT NULL DEFAULT '',
+	report_md text NOT NULL DEFAULT '',
+	questions jsonb NOT NULL DEFAULT '[]'::jsonb,
+	usage jsonb NOT NULL DEFAULT '{}'::jsonb,
+	archived_path text NOT NULL DEFAULT '',
+	created_at timestamptz NOT NULL DEFAULT now(),
+	updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS research_reports_lookup
+	ON research_reports (symbol, created_at DESC);
+`
+
 // Migrate creates the schema if it does not exist yet.
 func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.Pool.Exec(ctx, schema); err != nil {
@@ -448,6 +465,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.Pool.Exec(ctx, tickerMetricsSchema); err != nil {
 		return fmt.Errorf("store: migrate ticker_metrics: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, researchReportsSchema); err != nil {
+		return fmt.Errorf("store: migrate research_reports: %w", err)
 	}
 
 	for _, table := range tickerSectionTables() {
