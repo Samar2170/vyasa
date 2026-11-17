@@ -55,12 +55,13 @@ type AskTool struct {
 	verifier *agent.Agent
 	client   llm.ModelClient
 	recr     *sessionRecorder
+	budget   *llm.CostBudget
 }
 
 var _ types.Tool = (*AskTool)(nil)
 
-func NewAskTool(verifier *agent.Agent, client llm.ModelClient, rec *sessionRecorder) *AskTool {
-	return &AskTool{verifier: verifier, client: client, recr: rec}
+func NewAskTool(verifier *agent.Agent, client llm.ModelClient, rec *sessionRecorder, budget *llm.CostBudget) *AskTool {
+	return &AskTool{verifier: verifier, client: client, recr: rec, budget: budget}
 }
 
 func (t *AskTool) Name() string { return AskToolName }
@@ -94,6 +95,17 @@ func (t *AskTool) Execute(ctx context.Context, args string) types.ExecutionOutpu
 	a.Question = strings.TrimSpace(a.Question)
 	if a.Question == "" {
 		return types.ExecutionOutput{Error: "question is required", Duration: time.Since(start)}
+	}
+	// Budget spent: answer inline as a normal (non-error) tool result so
+	// the synthesizer does not retry the paid call and instead writes the
+	// report from the findings it already has.
+	if t.budget.Exhausted() {
+		return types.ExecutionOutput{
+			Output: "cost budget exhausted — the specialist could not be consulted for this question. " +
+				"Answer this part from the findings already available and list the question under " +
+				"'Questions resolved during synthesis' as unresolved, or drop it if it is not essential.",
+			Duration: time.Since(start),
+		}
 	}
 	res, err := t.verifier.Run(ctx, t.client, "", a.Question)
 	if err != nil {

@@ -73,6 +73,12 @@ type Settings struct {
 	// sweep at pool 32 is ~2,000 pairs; repeat runs spend nothing because
 	// every scored pair is cached.
 	RerankBudget int `json:"rerank_budget"`
+
+	// ResearchCostBudget caps the aggregate provider-reported dollar cost
+	// of one research workflow run (0 or absent = unlimited). When spent,
+	// remaining verification is skipped and a partial report is still
+	// persisted; the research CLI -budget flag overrides it per run.
+	ResearchCostBudget float64 `json:"research_cost_budget"`
 }
 
 const (

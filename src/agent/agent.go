@@ -62,6 +62,12 @@ func (a *Agent) Run(ctx context.Context, client llm.ModelClient, systemPrompt st
 	}
 	cfg.toolTimeout = a.StepTimeout
 
+	// DelegateTool passes "" as the system prompt; specialists keep their
+	// own configured prompt rather than running bare.
+	if strings.TrimSpace(systemPrompt) == "" {
+		systemPrompt = a.SystemPrompt
+	}
+
 	runID := newRunID()
 	maxSteps := a.MaxSteps
 	if maxSteps <= 0 {

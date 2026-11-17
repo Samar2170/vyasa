@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"vyasa/seed/equity"
+	"vyasa/src/agent"
 	"vyasa/src/client"
 	"vyasa/src/client/archivus"
 	"vyasa/src/client/av"
@@ -33,6 +34,7 @@ import (
 	"vyasa/src/metrics"
 	"vyasa/src/models"
 	"vyasa/src/rag"
+	"vyasa/src/research"
 	"vyasa/src/store"
 )
 
@@ -141,6 +143,19 @@ func main() {
 		budget := fs.Int("rerank-budget", settings.RerankBudget, "max cache-miss rerank pairs this run may bill (0 = unlimited)")
 		_ = fs.Parse(os.Args[2:])
 		runRAGEval(ctx, st, settings, *dataset, *k, *strict, *symbol, *out, *rerank, *budget)
+	case "research":
+		fs := flag.NewFlagSet("research", flag.ExitOnError)
+		symbol := fs.String("symbol", "", "company symbol to research")
+		out := fs.String("out", "reports", "directory for the markdown report")
+		steps := fs.Int("steps", 0, "optional per-agent step-limit override")
+		stream := fs.Bool("stream", false, "stream agent text deltas to the terminal")
+		budget := fs.Float64("budget", settings.ResearchCostBudget, "cost budget for the whole workflow in USD (0 = unlimited; default from config.json research_cost_budget)")
+		_ = fs.Parse(os.Args[2:])
+		if *symbol == "" {
+			log.Fatal("research requires -symbol SYMBOL")
+		}
+		storage := mustArchivus(settings)
+		runResearch(ctx, st, storage, settings, *symbol, *out, *steps, *stream, *budget)
 	default:
 		usage()
 	}
@@ -179,7 +194,11 @@ commands:
   rag-eval replay a golden dataset through hybrid search and score
             Hit@k/Recall/MRR/nDCG: [-dataset dataset/rag_golden.jsonl]
             [-k 1,3,5,8,10] [-strict] [-symbol RELIANCE] [-out results.jsonl]
-            [-rerank=false] [-rerank-budget 2000]`)
+            [-rerank=false] [-rerank-budget 2000]
+  research  run the equity research workflow for one company (metrics
+            analysis, annual report, investor presentation, synthesis with
+            clarifying Q&A; saves the markdown report to DB, file and
+            Archivus): -symbol RELIANCE [-out reports] [-steps N] [-stream]`)
 	os.Exit(2)
 }
 
@@ -908,4 +927,81 @@ func parseKs(spec string) ([]int, error) {
 	}
 	sort.Ints(out)
 	return out, nil
+}
+
+// runResearch executes the equity research workflow for one company and
+// prints the report plus where it was persisted.
+func runResearch(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings, symbol, outDir string, steps int, stream bool, budgetUSD float64) {
+	ai, err := llm.NewClient(settings.Provider, mustLLM(settings))
+	if err != nil {
+		log.Fatalf("research: %v", err)
+	}
+	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+	if settings.RerankOn() {
+		ix = ix.WithReranker(mustReranker(ctx, st, settings, nil), settings.RerankPool)
+	}
+
+	var sink agent.EventSink
+	if stream {
+		sink = streamSink()
+	}
+
+	res, err := research.Run(ctx, research.Deps{
+		St:            st,
+		Client:        ai,
+		Indexer:       ix,
+		Storage:       storage,
+		Model:         settings.Model,
+		ParentFolder:  settings.StorageParentFolder,
+		StepLimit:     steps,
+		Stream:        stream,
+		Sink:          sink,
+		CostBudgetUSD: budgetUSD,
+	}, symbol)
+	if err != nil {
+		log.Fatalf("research: %v", err)
+	}
+
+	log.Printf("[research] %s: report id %s, %d question(s) asked", symbol, res.Report.ID, len(res.Report.Questions))
+	log.Printf("[research] markdown: %s", res.FilePath)
+	if res.Report.ArchivedPath != "" {
+		log.Printf("[research] archived: %s", res.Report.ArchivedPath)
+	}
+	log.Printf("[research] usage: %d steps, in %d tok, out %d tok, cached %d tok",
+		res.Steps, res.Usage.InputTokens, res.Usage.OutputTokens, res.Usage.CachedTokens)
+	if res.Usage.Cost != nil {
+		log.Printf("[research] cost: $%.4f", *res.Usage.Cost)
+	}
+	if res.BudgetLimit > 0 {
+		log.Printf("[research] cost budget: $%.4f spent of $%.4f (exhausted: %v)",
+			res.BudgetSpent, res.BudgetLimit, res.BudgetExhausted)
+	}
+	for _, w := range res.Warnings {
+		log.Printf("[research] warning: %s", w)
+	}
+	if res.Finish != agent.FinishCompleted {
+		log.Printf("[research] warning: synthesizer finished with %s — report may be partial", res.Finish)
+	}
+	fmt.Println()
+	fmt.Println(res.Report.ReportMD)
+}
+
+// streamSink renders agent events for the terminal: text deltas inline,
+// tool calls and run completions as short lines.
+func streamSink() agent.EventSink {
+	var mu sync.Mutex
+	return func(e agent.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch e.Kind {
+		case agent.EventTextDelta:
+			fmt.Print(e.Text)
+		case agent.EventToolCall:
+			if e.ToolCall != nil {
+				fmt.Printf("\n→ %s\n", e.ToolCall.Name)
+			}
+		case agent.EventAgentDone:
+			fmt.Println()
+		}
+	}
 }

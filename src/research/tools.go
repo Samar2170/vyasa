@@ -76,6 +76,13 @@ func scopedRAGRegistry(d Deps, segment, prefix, label string) *types.Registry {
 	return reg
 }
 
+// WebTools returns the open-web agent tools for the verifier specialist:
+// web_search (DuckDuckGo, no API key) and web_fetch (URL text extraction).
+func WebTools() []types.Tool {
+	hc := &http.Client{Timeout: 30 * time.Second}
+	return []types.Tool{&webSearchTool{client: hc}, &webFetchTool{client: hc}}
+}
+
 type webSearchTool struct {
 	client *http.Client
 }
@@ -186,13 +193,15 @@ func parseWebResults(root *html.Node) []webResult {
 	var out []webResult
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "a" {
+		if n.Type == html.ElementNode {
 			cls := nodeAttr(n, "class")
 			switch {
-			case strings.Contains(cls, "result__a"), strings.Contains(cls, "result-link"):
+			case n.Data == "a" && (strings.Contains(cls, "result__a") || strings.Contains(cls, "result-link")):
 				if title := strings.TrimSpace(nodeText(n)); title != "" {
 					out = append(out, webResult{Title: title, URL: unwrapDDGLink(nodeAttr(n, "href"))})
 				}
+			// The snippet element differs per layout: <a class="result__snippet">
+			// on the HTML endpoint, <td class="result-snippet"> on Lite.
 			case strings.Contains(cls, "result__snippet"), strings.Contains(cls, "result-snippet"):
 				if len(out) > 0 && out[len(out)-1].Snippet == "" {
 					out[len(out)-1].Snippet = strings.TrimSpace(nodeText(n))
@@ -317,7 +326,8 @@ func isHTML(contentType, body string) bool {
 		if len(head) > 512 {
 			head = head[:512]
 		}
-		return strings.Contains(head, "<!DOCTYPE html") || strings.Contains(head, "<html")
+		head = strings.ToLower(head)
+		return strings.Contains(head, "<!doctype html") || strings.Contains(head, "<html")
 	}
 	return false
 }
@@ -364,12 +374,14 @@ func extractVisibleText(root *html.Node) string {
 	return collapseBlank(b.String())
 }
 
-// collapseBlank trims every line and drops empty ones.
+// collapseBlank trims every line, collapses internal whitespace runs and
+// drops empty ones.
 func collapseBlank(s string) string {
 	lines := strings.Split(s, "\n")
 	out := make([]string, 0, len(lines))
 	for _, ln := range lines {
-		if ln = strings.TrimSpace(ln); ln != "" {
+		ln = strings.Join(strings.Fields(ln), " ")
+		if ln != "" {
 			out = append(out, ln)
 		}
 	}
@@ -406,5 +418,3 @@ func nodeText(n *html.Node) string {
 func errOut(msg string, start time.Time) types.ExecutionOutput {
 	return types.ExecutionOutput{Error: msg, Duration: time.Since(start)}
 }
-
-// Typo note: in scopedRAGRegistry the second desc has "label + " " (P&L... — should be "(the "+label+")" style. Here's the corrected second registration:

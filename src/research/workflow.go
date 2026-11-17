@@ -2,6 +2,7 @@ package research
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -30,6 +31,11 @@ type Deps struct {
 	StepLimit    int                  // optional per-run step cap (0 = agent defaults)
 	Stream       bool                 // stream text deltas through the event sink
 	Sink         agent.EventSink      // optional event sink (set Stream to print deltas)
+	// CostBudgetUSD caps the aggregate provider-reported dollar cost of the
+	// whole workflow (0 = unlimited). When it runs out, in-flight phases
+	// finish, remaining verification is skipped and a partial report is
+	// still synthesized and persisted.
+	CostBudgetUSD float64
 }
 
 type Result struct {
@@ -39,6 +45,11 @@ type Result struct {
 	Usage    llm.Usage
 	Steps    int
 	Finish   agent.FinishStatus
+
+	BudgetSpent     float64
+	BudgetLimit     float64 // <= 0 = unlimited
+	BudgetExhausted bool
+	Warnings        []string
 }
 
 func Run(ctx context.Context, d Deps, symbol string) (*Result, error) {
@@ -54,9 +65,18 @@ func Run(ctx context.Context, d Deps, symbol string) (*Result, error) {
 		return nil, fmt.Errorf("research: %w", err)
 	}
 
+	// The cost budget is enforced at the client layer and shared through
+	// the run context: specialists, synthesizer and the ask tool's verifier
+	// all refuse further LLM calls once the limit is spent.
+	budget := llm.NewCostBudget(d.CostBudgetUSD)
+	client := llm.NewCostBudgetClient(d.Client)
+	runCtx := llm.WithCostBudget(ctx, budget)
+
 	rec := &sessionRecorder{}
 	verifier := newVerifierAgent(d, facts)
-	ask := NewAskTool(verifier, d.Client, rec)
+	ask := NewAskTool(verifier, client, rec, budget)
+
+	var warnings []string
 
 	specs := []struct {
 		name  string
@@ -84,8 +104,18 @@ func Run(ctx context.Context, d Deps, symbol string) (*Result, error) {
 			agent *agent.Agent
 		}) {
 			defer wg.Done()
-			res, err := spec.agent.Run(ctx, d.Client, "", spec.task, runOpts(d)...)
+			res, err := spec.agent.Run(runCtx, client, "", spec.task, runOpts(d)...)
 			if err != nil {
+				// A specialist stopped by the budget is a warning, not a
+				// failure: its partial (or missing) finding is carried on
+				// and the report is still synthesized.
+				if errors.Is(err, llm.ErrCostBudgetExhausted) {
+					mu.Lock()
+					warnings = append(warnings, fmt.Sprintf("%s: stopped by cost budget: %v", spec.name, err))
+					perAgent[spec.name] = map[string]any{"finish": agent.FinishError, "budget_exhausted": true}
+					mu.Unlock()
+					return
+				}
 				ferrs[i] = fmt.Errorf("research: %s: %w", spec.name, err)
 				return
 			}
@@ -105,8 +135,13 @@ func Run(ctx context.Context, d Deps, symbol string) (*Result, error) {
 	}
 
 	synth := newSynthesizer(d, ask, facts)
-	res, err := synth.Run(ctx, d.Client, "", synthesisInput(co, findings), runOpts(d)...)
-	if err != nil {
+	res, err := synth.Run(runCtx, client, "", synthesisInput(co, findings), runOpts(d)...)
+	if err != nil && errors.Is(err, llm.ErrCostBudgetExhausted) {
+		// The budget ran out before synthesis could run: persist the raw
+		// findings as a partial report instead of losing the spend.
+		warnings = append(warnings, fmt.Sprintf("synthesizer: stopped by cost budget: %v", err))
+		res = &agent.Result{FinalText: fallbackReport(co, findings), Finish: agent.FinishCompleted}
+	} else if err != nil {
 		return nil, fmt.Errorf("research: synthesizer: %w", err)
 	}
 	mu.Lock()
@@ -119,6 +154,7 @@ func Run(ctx context.Context, d Deps, symbol string) (*Result, error) {
 	mu.Unlock()
 
 	now := time.Now()
+	spent, limit := budget.Snapshot()
 	report := models.ResearchReport{
 		CompanyID: co.ID,
 		Symbol:    co.Symbol,
@@ -128,6 +164,11 @@ func Run(ctx context.Context, d Deps, symbol string) (*Result, error) {
 		Usage: map[string]any{
 			"model":  d.Model,
 			"agents": perAgent,
+			"cost_budget": map[string]any{
+				"limit":     limit,
+				"spent":     spent,
+				"exhausted": budget.Exhausted(),
+			},
 		},
 	}
 	filePath, err := writeMarkdown(outDir(), co.Symbol, res.FinalText, now)
@@ -153,8 +194,12 @@ func Run(ctx context.Context, d Deps, symbol string) (*Result, error) {
 		Usage:    total,
 		Steps:    steps,
 		Finish:   res.Finish,
-	}, nil
 
+		BudgetSpent:     spent,
+		BudgetLimit:     limit,
+		BudgetExhausted: budget.Exhausted(),
+		Warnings:        warnings,
+	}, nil
 }
 
 func outDir() string { return "reports" }
@@ -263,11 +308,11 @@ func newVerifierAgent(d Deps, facts []string) *agent.Agent {
 	}
 	reg.Register(rag.NewSearchTool(d.St, d.Indexer))
 	reg.Register(rag.NewTableSearchTool(d.St, d.Indexer))
-	for _, t := range webTools() {
+	for _, t := range WebTools() {
 		reg.Register(t)
 	}
 	return &agent.Agent{
-		Name:         "reasearch_verifier",
+		Name:         "research_verifier",
 		Description:  "Answers one specific research question using metrics, filings retrieval and the open web.",
 		SystemPrompt: verifierPrompt,
 		Facts:        facts,
@@ -320,6 +365,31 @@ func synthesisInput(co *models.Company, findings []string) string {
 	}
 	b.WriteString("---\n\nSynthesize the findings above into the final equity research report. Reconcile contradictions and fill gaps: if something is unclear, incomplete or disputed, call ask_specialist with one specific question before writing that part. When ready, output ONLY the markdown report.")
 	return b.String()
+}
+
+// fallbackReport renders the specialist findings as a partial report when
+// the cost budget ran out before synthesis could run. Empty findings are
+// marked as not produced rather than invented.
+func fallbackReport(co *models.Company, findings []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s (%s) — Equity Research\n\n", co.Name, co.Symbol)
+	b.WriteString("> Partial report: the cost budget ran out before synthesis could run. ")
+	b.WriteString("The specialist findings below are included unedited.\n\n")
+	labels := []string{"Financial analysis (metrics)", "Annual report findings", "Investor presentation findings"}
+	for i, f := range findings {
+		label := "Specialist finding"
+		if i < len(labels) {
+			label = labels[i]
+		}
+		fmt.Fprintf(&b, "## %s\n\n", label)
+		if text := strings.TrimSpace(f); text != "" {
+			b.WriteString(text)
+			b.WriteString("\n\n")
+		} else {
+			b.WriteString("Not produced — the cost budget was exhausted before this specialist finished.\n\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n") + "\n"
 }
 
 // companyFacts renders the shared context every agent's system prompt gets.
