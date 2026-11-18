@@ -117,6 +117,11 @@ same LLM and tool interfaces.
 │   │   ├── tools.go              #   agent tools: metrics_series (multi-metric × multi-year) + metrics_snapshot (all metrics for one FY, incl. data_gaps)
 │   │   ├── metrics_test.go       #   compute fixtures mirroring the stored statement JSON
 │   │   └── tools_test.go         #   FY normalization, metric-name resolution, series/snapshot projection
+│   ├── session/                  # package session: agent session logs (session_logs) + terminal trace rendering
+│   │   ├── session.go            #   Logger: async batched event persistence per session id; delta coalescing; Tee
+│   │   ├── payload.go            #   agent.Event → payload jsonb conversion
+│   │   ├── terminal.go           #   TerminalSink: verbose per-agent trace lines (runs, steps, tool calls, usage)
+│   │   └── *_test.go
 │   ├── store/                    # package store: PostgreSQL connection, schema, and all queries
 │   │   ├── store.go              #   Store: idempotent schema creation (pgx), jsonb payloads + indexed columns
 │   │   ├── tables.go             #   per-section tickertape tables (shared schema)
@@ -124,6 +129,7 @@ same LLM and tool interfaces.
 │   │   ├── metrics.go            #   LatestStatement reads, MetricsSymbols listing, UpsertMetrics + GetMetrics on ticker_metrics
 │   │   ├── rag.go                #   RAG queries: insert/delete chunks, vector + lexical search, SearchRAGHybrid + FuseRRF, MarkResourceIndexed
 │   │   ├── rerank_cache.go      #   persistent rerank-score cache (pair-hash keyed)
+│   │   ├── sessions.go           #   session_logs: batched agent-event inserts + per-session reader
 │   │   └── rag_test.go
 │   └── types/                   # package types: Tool interface + Registry shared by agent, llm, rag
 │       └── tool.go              #   Tool interface, ExecutionOutput, Registry
@@ -155,6 +161,7 @@ same LLM and tool interfaces.
 | `src/config` | `config.json` settings + `.env` secret loading |
 | `src/eval` | Golden-dataset generation and retrieval metrics (Hit@k, Recall@k, MRR, nDCG) |
 | `src/metrics` | Per-FY key metrics derived from the annual tickertape statements (raw copies, growth, margins, returns, solvency, working capital, cash flow) |
+| `src/session` | Agent session logs: async persistence of the event stream to session_logs (jsonb payloads) + verbose terminal trace rendering |
 | `src/helpers` | Small shared utilities |
 | `src/llm` | Provider-agnostic LLM clients, embeddings, reranker, budgets, transports; `providers/openrouter` |
 | `src/models` | Domain types + table names (jsonb payloads, indexed columns) |
