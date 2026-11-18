@@ -295,6 +295,42 @@ ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '';
 ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS is_quarterly boolean NOT NULL DEFAULT false;
 `
 
+// ragTablesSchema stores extracted financial tables as first-class retrieval
+// units, separate from the prose chunks in rag_chunks. Text carries the
+// serialized (markdown) table that is embedded and lexically searched;
+// content keeps the raw cell grid as jsonb. One row per table.
+const ragTablesSchema = `
+
+CREATE TABLE IF NOT EXISTS rag_tables (
+	id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+	company_id text NOT NULL,
+	symbol text NOT NULL DEFAULT '',
+	segment text NOT NULL DEFAULT '',
+	document_url text NOT NULL DEFAULT '',
+	ordinal integer NOT NULL DEFAULT 0,
+	page integer NOT NULL DEFAULT 0,
+	caption text NOT NULL DEFAULT '',
+	n_rows integer NOT NULL DEFAULT 0,
+	n_cols integer NOT NULL DEFAULT 0,
+	content jsonb NOT NULL DEFAULT '{}'::jsonb,
+	text text NOT NULL DEFAULT '',
+	embedding vector(%[1]d) NOT NULL,
+	model text NOT NULL DEFAULT '',
+	period text NOT NULL DEFAULT '',
+	source text NOT NULL DEFAULT '',
+	is_quarterly boolean NOT NULL DEFAULT false,
+	tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
+	created_at timestamptz NOT NULL DEFAULT now(),
+	updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS rag_tables_lookup
+	ON rag_tables (company_id, segment);
+CREATE INDEX IF NOT EXISTS rag_tables_vector
+	ON rag_tables USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS rag_tables_lexical
+	ON rag_tables USING gin (tsv);
+`
+
 const rerankCacheSchema = `
 DROP TABLE IF EXISTS rerank_cache;
 CREATE TABLE IF NOT EXISTS rerank_score_cache (
@@ -302,6 +338,137 @@ CREATE TABLE IF NOT EXISTS rerank_score_cache (
 	score real NOT NULL,
 	created_at timestamptz NOT NULL DEFAULT now()
 );
+`
+
+// tickerMetricsSchema holds the per-FY derived metrics computed from the
+// annual statement tables. Every metric is a real column (NULL when the
+// inputs are missing) so the series stay directly queryable; data_gaps
+// records which inputs were missing for each FY.
+const tickerMetricsSchema = `
+CREATE TABLE IF NOT EXISTS ticker_metrics (
+	id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+	company_id text NOT NULL DEFAULT '',
+	symbol text NOT NULL,
+	fy text NOT NULL,
+	end_date date NOT NULL,
+	data_gaps jsonb NOT NULL DEFAULT '[]'::jsonb,
+
+	total_revenue double precision,
+	gross_profit double precision,
+	ebitda double precision,
+	ebit double precision,
+	pbt double precision,
+	net_income double precision,
+	eps double precision,
+	cfo double precision,
+	capex double precision,
+	fcf double precision,
+	total_equity double precision,
+	minority_interest double precision,
+	net_worth double precision,
+	total_debt double precision,
+	cash_and_sti double precision,
+	total_assets double precision,
+	current_assets double precision,
+	current_liabilities double precision,
+	receivables double precision,
+	inventory double precision,
+	payables double precision,
+	shares_outstanding double precision,
+
+	revenue_yoy double precision,
+	revenue_cagr_3y double precision,
+	revenue_cagr_5y double precision,
+	ebitda_yoy double precision,
+	ebitda_cagr_3y double precision,
+	ebitda_cagr_5y double precision,
+	ebit_yoy double precision,
+	ebit_cagr_3y double precision,
+	ebit_cagr_5y double precision,
+	pat_yoy double precision,
+	pat_cagr_3y double precision,
+	pat_cagr_5y double precision,
+	eps_yoy double precision,
+	eps_cagr_3y double precision,
+	eps_cagr_5y double precision,
+
+	dol_ebit double precision,
+	dol_ebitda double precision,
+	gross_margin double precision,
+	ebitda_margin double precision,
+	ebit_margin double precision,
+	net_margin double precision,
+
+	roe double precision,
+	ronw double precision,
+	roce double precision,
+	roic double precision,
+
+	debt_to_equity double precision,
+	net_debt double precision,
+	net_debt_to_ebitda double precision,
+	interest_coverage double precision,
+	current_ratio double precision,
+
+	dso_days double precision,
+	dio_days double precision,
+	dpo_days double precision,
+	wc_cycle_days double precision,
+	receivables_yoy double precision,
+	receivables_pct_revenue double precision,
+	inventory_yoy double precision,
+	inventory_pct_revenue double precision,
+	payables_yoy double precision,
+	payables_pct_cogs double precision,
+
+	fcf_margin double precision,
+	cfo_to_pat double precision,
+	fcf_to_pat double precision,
+	cfo_to_ebitda double precision,
+
+	created_at timestamptz NOT NULL DEFAULT now(),
+	updated_at timestamptz NOT NULL DEFAULT now(),
+	UNIQUE (symbol, fy)
+);
+`
+
+const researchReportsSchema = `
+CREATE TABLE IF NOT EXISTS research_reports (
+	id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+	company_id text NOT NULL DEFAULT '',
+	symbol text NOT NULL,
+	title text NOT NULL DEFAULT '',
+	report_md text NOT NULL DEFAULT '',
+	questions jsonb NOT NULL DEFAULT '[]'::jsonb,
+	usage jsonb NOT NULL DEFAULT '{}'::jsonb,
+	archived_path text NOT NULL DEFAULT '',
+	created_at timestamptz NOT NULL DEFAULT now(),
+	updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS research_reports_lookup
+	ON research_reports (symbol, created_at DESC);
+`
+
+// sessionLogsSchema is the flat agent event log: one row per emitted event,
+// with the event-specific data (run input, streamed text, tool call +
+// output, usage, error) in the payload jsonb column. A session is the
+// events of one CLI invocation grouped by session_id; run_id/parent_id
+// reconstruct the delegation tree.
+const sessionLogsSchema = `
+CREATE TABLE IF NOT EXISTS session_logs (
+	id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+	session_id text NOT NULL,
+	seq integer NOT NULL,
+	run_id text NOT NULL DEFAULT '',
+	parent_id text NOT NULL DEFAULT '',
+	agent text NOT NULL DEFAULT '',
+	kind text NOT NULL,
+	step integer NOT NULL DEFAULT 0,
+	payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+	created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS session_logs_lookup
+	ON session_logs (session_id, seq);
 `
 
 // Migrate creates the schema if it does not exist yet.
@@ -312,8 +479,20 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.Pool.Exec(ctx, fmt.Sprintf(ragChunksSchema, s.embedDim)); err != nil {
 		return fmt.Errorf("store: migrate rag_chunks: %w", err)
 	}
+	if _, err := s.Pool.Exec(ctx, fmt.Sprintf(ragTablesSchema, s.embedDim)); err != nil {
+		return fmt.Errorf("store: migrate rag_tables: %w", err)
+	}
 	if _, err := s.Pool.Exec(ctx, rerankCacheSchema); err != nil {
 		return fmt.Errorf("store: migrate rerank_cache: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, tickerMetricsSchema); err != nil {
+		return fmt.Errorf("store: migrate ticker_metrics: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, researchReportsSchema); err != nil {
+		return fmt.Errorf("store: migrate research_reports: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, sessionLogsSchema); err != nil {
+		return fmt.Errorf("store: migrate session_logs: %w", err)
 	}
 
 	for _, table := range tickerSectionTables() {

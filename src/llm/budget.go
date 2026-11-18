@@ -126,3 +126,133 @@ func (c BudgetClient) Stream(ctx context.Context, req Request) (Stream, error) {
 	}
 	return c.ModelClient.Stream(ctx, req)
 }
+
+// --- cost budget --------------------------------------------------------
+
+// ErrCostBudgetExhausted signals that the aggregate USD cost budget is
+// spent and further LLM calls are refused.
+var ErrCostBudgetExhausted = errors.New("llm cost budget exhausted")
+
+// CostBudget caps the aggregate dollar cost of the LLM calls issued under
+// it (the provider-reported usage.cost of every call). A limit <= 0 means
+// unlimited. Safe for concurrent use.
+type CostBudget struct {
+	mu    sync.Mutex
+	limit float64
+	spent float64
+}
+
+// NewCostBudget builds a cost budget capped at limitUSD; values <= 0 are
+// unlimited.
+func NewCostBudget(limitUSD float64) *CostBudget {
+	return &CostBudget{limit: limitUSD}
+}
+
+// Add records the reported cost of one LLM call.
+func (b *CostBudget) Add(cost float64) {
+	if b == nil || cost <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.spent += cost
+}
+
+// Exhausted reports whether further LLM calls should be refused.
+func (b *CostBudget) Exhausted() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.limit > 0 && b.spent >= b.limit
+}
+
+// Snapshot reports the spend so far and the limit (<= 0 when unlimited).
+func (b *CostBudget) Snapshot() (spent, limit float64) {
+	if b == nil {
+		return 0, 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.spent, b.limit
+}
+
+type costBudgetCtxKey struct{}
+
+// WithCostBudget attaches a cost budget to ctx; every LLM call issued with
+// the returned context enforces it. A nil budget is unlimited.
+func WithCostBudget(ctx context.Context, b *CostBudget) context.Context {
+	return context.WithValue(ctx, costBudgetCtxKey{}, b)
+}
+
+func costBudgetFrom(ctx context.Context) *CostBudget {
+	b, _ := ctx.Value(costBudgetCtxKey{}).(*CostBudget)
+	return b
+}
+
+// refuseErr builds the budget-exhausted error with the current spend.
+func refuseErr(b *CostBudget) error {
+	spent, limit := b.Snapshot()
+	return fmt.Errorf("%w: $%.4f spent of $%.4f limit", ErrCostBudgetExhausted, spent, limit)
+}
+
+// CostBudgetClient wraps a ModelClient and enforces the CostBudget attached
+// to the call context (see WithCostBudget). Calls are refused once the
+// accumulated provider-reported cost reaches the limit; the cost of calls
+// already in flight when the limit is crossed still lands (the pre-check
+// only gates new calls).
+type CostBudgetClient struct {
+	ModelClient
+}
+
+// NewCostBudgetClient returns a cost-budget-enforcing view of client.
+func NewCostBudgetClient(client ModelClient) CostBudgetClient {
+	return CostBudgetClient{ModelClient: client}
+}
+
+// Complete refuses the call when the budget is exhausted, then records the
+// response's reported cost.
+func (c CostBudgetClient) Complete(ctx context.Context, req Request) (*Response, error) {
+	if b := costBudgetFrom(ctx); b.Exhausted() {
+		return nil, refuseErr(b)
+	}
+	resp, err := c.ModelClient.Complete(ctx, req)
+	if err != nil {
+		return resp, err
+	}
+	if b := costBudgetFrom(ctx); b != nil && resp.Usage.Cost != nil {
+		b.Add(*resp.Usage.Cost)
+	}
+	return resp, nil
+}
+
+// Stream refuses the call when the budget is exhausted, then meters the
+// stream: the first usage-carrying chunk records its cost (OpenRouter
+// reports usage once, in the final IncludeUsage chunk).
+func (c CostBudgetClient) Stream(ctx context.Context, req Request) (Stream, error) {
+	if b := costBudgetFrom(ctx); b.Exhausted() {
+		return nil, refuseErr(b)
+	}
+	s, err := c.ModelClient.Stream(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return &costStream{Stream: s, budget: costBudgetFrom(ctx)}, nil
+}
+
+type costStream struct {
+	Stream
+	budget   *CostBudget
+	recorded bool
+}
+
+func (s *costStream) Recv() (*Chunk, error) {
+	chunk, err := s.Stream.Recv()
+	if err == nil && chunk != nil && !s.recorded && s.budget != nil &&
+		chunk.Usage != nil && chunk.Usage.Cost != nil {
+		s.budget.Add(*chunk.Usage.Cost)
+		s.recorded = true
+	}
+	return chunk, err
+}

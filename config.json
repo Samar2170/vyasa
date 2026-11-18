@@ -9,6 +9,7 @@
   "embedding_provider": "Azure",
   "rerank_model": "cohere/rerank-5-fast",
   "rerank_pool": 32,
-  "rerank_enabled": true
+  "rerank_enabled": true,
+  "research_cost_budget": 2.00
 }
 

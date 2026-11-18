@@ -12,9 +12,17 @@ const (
 	TableCompanyResources = "company_research_resources"
 	TableSavedFiles       = "saved_files"
 
-	TableDocumentChunks = "document_chunks"
-	TableRAGChunks      = "rag_chunks"
+	TableDocumentChunks  = "document_chunks"
+	TableRAGChunks       = "rag_chunks"
+	TableRAGTables       = "rag_tables"
+	TableResearchReports = "research_reports"
+	TableSessionLogs     = "session_logs"
 )
+
+// HitKindTable marks a RAGHit that was retrieved from the rag_tables store
+// rather than the prose rag_chunks store. Any other Kind (including empty)
+// is a prose chunk.
+const HitKindTable = "table"
 
 // BaseModel carries the columns shared by every table.
 type BaseModel struct {
@@ -24,7 +32,6 @@ type BaseModel struct {
 }
 
 type Company struct {
-	
 	BaseModel
 	Symbol   string `json:"symbol"`
 	Exchange string `json:"exchange,omitempty"`
@@ -97,6 +104,41 @@ type RAGChunk struct {
 	// "investor_relations".
 	Source      string `json:"source,omitempty"`
 	IsQuarterly bool   `json:"is_quarterly,omitempty"`
+	// Kind marks prose ("", never stored) vs table hits retrieved from the
+	// separate rag_tables store and merged into the same result list.
+	Kind string `json:"kind,omitempty"`
+}
+
+// TableGrid is the raw cell grid of an extracted table, stored as jsonb so
+// downstream consumers get the numbers back without re-parsing markdown.
+type TableGrid struct {
+	Header []string   `json:"header,omitempty"`
+	Rows   [][]string `json:"rows"`
+}
+
+// RAGTable is one extracted financial table indexed for retrieval. Text
+// carries the serialized (markdown) form that is embedded and lexically
+// searched; Content keeps the raw grid. One row per table.
+type RAGTable struct {
+	BaseModel
+	CompanyID   string    `json:"company_id"`
+	Symbol      string    `json:"symbol"`
+	Segment     string    `json:"segment"`
+	DocumentURL string    `json:"document_url"`
+	Ordinal     int       `json:"ordinal"`
+	Page        int       `json:"page"`
+	Caption     string    `json:"caption"`
+	NRows       int       `json:"n_rows"`
+	NCols       int       `json:"n_cols"`
+	Content     TableGrid `json:"content,omitempty"`
+	Text        string    `json:"text"`
+	Model       string    `json:"model"`
+	Embedding   []float32 `json:"embedding"`
+
+	Period string `json:"period,omitempty"`
+	Source string `json:"source,omitempty"`
+	// IsQuarterly mirrors the parent document's quarterly flag.
+	IsQuarterly bool `json:"is_quarterly,omitempty"`
 }
 
 type RAGHit struct {
@@ -107,4 +149,37 @@ type RAGHit struct {
 	// reranked; Reranked marks that.
 	RerankScore float64 `json:"rerank_score,omitempty"`
 	Reranked    bool    `json:"reranked,omitempty"`
+}
+
+type QAPair struct {
+	Question string `json:"question"`
+	Answer   string `json:"answer"`
+}
+
+type ResearchReport struct {
+	BaseModel
+	CompanyID    string         `json:"company_id"`
+	Symbol       string         `json:"symbol"`
+	Title        string         `json:"title"`
+	ReportMD     string         `json:"report_md"`
+	Questions    []QAPair       `json:"questions,omitempty"`
+	Usage        map[string]any `json:"usage,omitempty"`
+	ArchivedPath string         `json:"archived_path,omitempty"`
+}
+
+// SessionEvent is one row of the agent event stream persisted in
+// session_logs: everything an agent run emits (run boundaries, steps, tool
+// calls + outputs, streamed text, usage) lands here with the
+// event-specific data inside the payload jsonb column. Rows form a flat
+// event log that reconstructs the delegation tree via run_id/parent_id
+// (see src/agent/DESIGN.md §5); seq orders the events within a session.
+type SessionEvent struct {
+	SessionID string         `json:"session_id"`
+	Seq       int            `json:"seq"`
+	RunID     string         `json:"run_id,omitempty"`
+	ParentID  string         `json:"parent_id,omitempty"`
+	Agent     string         `json:"agent,omitempty"`
+	Kind      string         `json:"kind"`
+	Step      int            `json:"step"`
+	Payload   map[string]any `json:"payload,omitempty"`
 }

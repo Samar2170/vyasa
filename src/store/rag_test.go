@@ -12,7 +12,7 @@ func TestFuseRRF(t *testing.T) {
 	vec := []models.RAGChunk{chunk("a"), chunk("b")}
 	lex := []models.RAGChunk{chunk("b"), chunk("c")}
 
-	hits := FuseRRF(vec, lex, 3)
+	hits := FuseRRF(3, vec, lex)
 	if len(hits) != 3 {
 		t.Fatalf("got %d hits, want 3", len(hits))
 	}
@@ -34,9 +34,9 @@ func TestFuseRRFTiesAreDeterministic(t *testing.T) {
 	vec := []models.RAGChunk{chunk("z"), chunk("a")}
 	lex := []models.RAGChunk{chunk("y"), chunk("c")}
 
-	first := FuseRRF(vec, lex, 4)
+	first := FuseRRF(4, vec, lex)
 	for i := 0; i < 200; i++ {
-		again := FuseRRF(vec, lex, 4)
+		again := FuseRRF(4, vec, lex)
 		for j := range first {
 			if first[j].ID != again[j].ID {
 				t.Fatalf("tie order unstable across runs: run %d pos %d gave %s, want %s",
@@ -54,8 +54,36 @@ func TestFuseRRFTruncates(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		vec = append(vec, chunk(string(rune('a'+i))))
 	}
-	hits := FuseRRF(vec, nil, 3)
+	hits := FuseRRF(3, vec, nil)
 	if len(hits) != 3 || hits[0].ID != "a" {
 		t.Errorf("unexpected hits: %+v", hits)
+	}
+}
+
+func tableChunk(id string) models.RAGChunk {
+	c := chunk(id)
+	c.Kind = models.HitKindTable
+	return c
+}
+
+func TestFuseRRFTablesCompeteWithProse(t *testing.T) {
+	// a table found by both table lists outranks prose found once; the kind
+	// must survive the fusion
+	proseVec := []models.RAGChunk{chunk("p1"), chunk("p2")}
+	tableVec := []models.RAGChunk{tableChunk("t1")}
+	tableLex := []models.RAGChunk{tableChunk("t1")}
+
+	hits := FuseRRF(4, proseVec, tableVec, tableLex)
+	if len(hits) != 3 {
+		t.Fatalf("hits = %d, want 3", len(hits))
+	}
+	if hits[0].ID != "t1" {
+		t.Errorf("top hit = %s, want t1 (on two lists)", hits[0].ID)
+	}
+	if hits[0].Kind != models.HitKindTable {
+		t.Errorf("kind lost in fusion: %q", hits[0].Kind)
+	}
+	if hits[1].Kind == models.HitKindTable {
+		t.Errorf("prose hit carries table kind")
 	}
 }

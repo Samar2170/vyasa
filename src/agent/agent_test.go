@@ -313,7 +313,7 @@ func TestRunEvents(t *testing.T) {
 			kinds = append(kinds, e.Kind)
 		}
 	}
-	want := []EventKind{EventStepStart, EventLLMStart, EventToolCall, EventToolResult, EventStepStart, EventLLMStart}
+	want := []EventKind{EventRunStart, EventStepStart, EventLLMStart, EventToolCall, EventToolResult, EventStepStart, EventLLMStart}
 	if strings.Join(fmtKinds(kinds), ",") != strings.Join(fmtKinds(want), ",") {
 		t.Errorf("kinds = %v, want %v", kinds, want)
 	}

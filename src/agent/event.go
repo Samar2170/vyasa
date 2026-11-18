@@ -8,6 +8,7 @@ import (
 type EventKind string
 
 const (
+	EventRunStart   EventKind = "run_start"
 	EventStepStart  EventKind = "step_start"
 	EventLLMStart   EventKind = "llm_start"
 	EventTextDelta  EventKind = "text_delta"
@@ -20,11 +21,13 @@ type Event struct {
 	Kind       EventKind
 	RunID      string
 	ParentID   string // set for sub-agent runs (delegation tree)
+	Agent      string // name of the agent that produced the event
 	Step       int
-	Text       string // text delta or final text
+	Text       string // run input, text delta or final text
 	ToolCall   *llm.ToolCall
 	ToolOutput *types.ExecutionOutput
 	Usage      *llm.Usage
+	Finish     FinishStatus // set on agent_done
 	Err        error
 }
 

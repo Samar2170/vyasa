@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"vyasa/seed/equity"
+	"vyasa/src/agent"
 	"vyasa/src/client"
 	"vyasa/src/client/archivus"
 	"vyasa/src/client/av"
@@ -30,8 +31,11 @@ import (
 	"vyasa/src/eval"
 	"vyasa/src/llm"
 	"vyasa/src/llm/providers/openrouter"
+	"vyasa/src/metrics"
 	"vyasa/src/models"
 	"vyasa/src/rag"
+	"vyasa/src/research"
+	"vyasa/src/session"
 	"vyasa/src/store"
 )
 
@@ -82,9 +86,17 @@ func main() {
 	case "rag-index":
 		fs := flag.NewFlagSet("rag-index", flag.ExitOnError)
 		force := fs.Bool("force", false, "re-index every archived filing, even ones already indexed")
+		tables := fs.Bool("tables", true, "also extract and index financial tables from the PDFs")
 		_ = fs.Parse(os.Args[2:])
 		storage := mustArchivus(settings)
-		runRAGIndex(ctx, st, storage, settings, *force)
+		runRAGIndex(ctx, st, storage, settings, *force, *tables)
+	case "rag-tables":
+		fs := flag.NewFlagSet("rag-tables", flag.ExitOnError)
+		symbol := fs.String("symbol", "", "limit the migration to one symbol")
+		dryRun := fs.Bool("dry-run", false, "list what would be processed without touching anything")
+		_ = fs.Parse(os.Args[2:])
+		storage := mustArchivus(settings)
+		runRAGTables(ctx, st, storage, settings, *symbol, *dryRun)
 	case "rag-search":
 		fs := flag.NewFlagSet("rag-search", flag.ExitOnError)
 		symbol := fs.String("symbol", "", "company symbol to search filings for")
@@ -96,7 +108,24 @@ func main() {
 		if *symbol == "" || *query == "" {
 			log.Fatal("rag-search requires -symbol SYMBOL and -query QUERY")
 		}
-		runRAGSearch(ctx, st, settings, *symbol, *segment, *query, *k, *rerank)
+		runRAGSearch(ctx, st, settings, *symbol, *segment, *query, *k, *rerank, false)
+	case "rag-table-search":
+		fs := flag.NewFlagSet("rag-table-search", flag.ExitOnError)
+		symbol := fs.String("symbol", "", "company symbol to search tables for")
+		query := fs.String("query", "", "search query, e.g. 'consolidated revenue by quarter'")
+		segment := fs.String("segment", "", "optional segment filter (annual_report, investor_presentation, earnings_call_transcript, quarterly_financials)")
+		k := fs.Int("k", 8, "max tables")
+		rerank := fs.Bool("rerank", true, "use the cross-encoder reranker (-rerank=false to disable)")
+		_ = fs.Parse(os.Args[2:])
+		if *symbol == "" || *query == "" {
+			log.Fatal("rag-table-search requires -symbol SYMBOL and -query QUERY")
+		}
+		runRAGSearch(ctx, st, settings, *symbol, *segment, *query, *k, *rerank, true)
+	case "metrics":
+		fs := flag.NewFlagSet("metrics", flag.ExitOnError)
+		symbols := fs.String("symbol", "", "comma-separated symbols (default: every symbol with statement data)")
+		_ = fs.Parse(os.Args[2:])
+		runMetrics(ctx, st, parseSymbols(*symbols))
 	case "rag-eval-gen":
 		fs := flag.NewFlagSet("rag-eval-gen", flag.ExitOnError)
 		symbols := fs.String("symbol", "", "comma-separated symbols to sample (default: every indexed symbol)")
@@ -115,6 +144,20 @@ func main() {
 		budget := fs.Int("rerank-budget", settings.RerankBudget, "max cache-miss rerank pairs this run may bill (0 = unlimited)")
 		_ = fs.Parse(os.Args[2:])
 		runRAGEval(ctx, st, settings, *dataset, *k, *strict, *symbol, *out, *rerank, *budget)
+	case "research":
+		fs := flag.NewFlagSet("research", flag.ExitOnError)
+		symbol := fs.String("symbol", "", "company symbol to research")
+		out := fs.String("out", "reports", "directory for the markdown report")
+		steps := fs.Int("steps", 0, "optional per-agent step-limit override")
+		stream := fs.Bool("stream", true, "stream agent text deltas to the terminal (-stream=false to disable)")
+		quiet := fs.Bool("quiet", false, "suppress the live agent trace (session logging to PostgreSQL still runs)")
+		budget := fs.Float64("budget", settings.ResearchCostBudget, "cost budget for the whole workflow in USD (0 = unlimited; default from config.json research_cost_budget)")
+		_ = fs.Parse(os.Args[2:])
+		if *symbol == "" {
+			log.Fatal("research requires -symbol SYMBOL")
+		}
+		storage := mustArchivus(settings)
+		runResearch(ctx, st, storage, settings, *symbol, *out, *steps, *stream, *quiet, *budget)
 	default:
 		usage()
 	}
@@ -132,18 +175,34 @@ commands:
             saved pages in tickertape_files/)
   ir        fetch and archive investor-relations filings (annual report,
             presentation, transcript, quarterly financials): -symbol RELIANCE
-  rag-index index archived filings (chunk, embed, store): [-force] re-index
-            even already-indexed investor-relations filings
+  metrics   compute per-FY key metrics from the annual statement tables and
+            store them in ticker_metrics: [-symbol CSV] (default: every
+            symbol with statement data)
+  rag-index index archived filings (chunk, embed, store), plus financial
+            tables into the separate rag_tables store [-tables=false]:
+            [-force] re-index even already-indexed investor-relations filings
+  rag-tables backfill financial tables for filings archived before table
+            extraction existed (downloads each PDF, mines tables, indexes
+            them, archives the JSON): [-symbol SYM] [-dry-run]
   rag-search hybrid semantic+keyword search over indexed filings, reranked
             by a cross-encoder: -symbol RELIANCE -query "capex guidance"
             [-segment ...] [-k 8] [-rerank=false]
+  rag-table-search the same over the extracted financial tables: -symbol
+            RELIANCE -query "consolidated revenue by quarter" [-segment ...]
+            [-k 8] [-rerank=false]
   rag-eval-gen draft a retrieval-eval golden dataset from indexed chunks:
             [-symbol CSV] [-n 60] [-out dataset/rag_golden.jsonl] (review the
             draft by hand before running rag-eval on it)
   rag-eval replay a golden dataset through hybrid search and score
             Hit@k/Recall/MRR/nDCG: [-dataset dataset/rag_golden.jsonl]
             [-k 1,3,5,8,10] [-strict] [-symbol RELIANCE] [-out results.jsonl]
-            [-rerank=false] [-rerank-budget 2000]`)
+            [-rerank=false] [-rerank-budget 2000]
+  research  run the equity research workflow for one company (metrics
+            analysis, annual report, investor presentation, synthesis with
+            clarifying Q&A; saves the markdown report to DB, file and
+            Archivus). The whole agent trace streams to the terminal and is
+            persisted to the session_logs table: -symbol RELIANCE
+            [-out reports] [-steps N] [-stream=false] [-quiet] [-budget N]`)
 	os.Exit(2)
 }
 
@@ -385,8 +444,10 @@ func mustReranker(ctx context.Context, st *store.Store, settings config.Settings
 // re-extracts text from the archived PDF (so chunks get [[page N]] markers
 // and refreshed section detection), chunks + embeds + stores it, uploads the
 // refreshed text back to Archivus and marks the resource indexed. With
-// force, investor-relations resources already indexed are re-processed too.
-func runRAGIndex(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings, force bool) {
+// tables, the PDF is also mined for financial tables which are indexed into
+// the separate rag_tables store. With force, investor-relations resources
+// already indexed are re-processed too.
+func runRAGIndex(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings, force, tables bool) {
 	arch, ok := storage.(*archivus.ArchivusClient)
 	if !ok {
 		log.Fatal("rag-index: storage client does not support file lookup")
@@ -411,7 +472,7 @@ func runRAGIndex(ctx context.Context, st *store.Store, storage client.StorageCli
 	var failed int
 	for _, p := range pending {
 		start := time.Now()
-		text, err := filingText(arch, settings.StorageParentFolder, p)
+		text, pdfBytes, err := filingText(arch, settings.StorageParentFolder, p)
 		if err != nil {
 			log.Printf("[rag-index] %s: %s: fetch %s: %v", p.Symbol, p.AnalysisSegment, p.RawDataUrl, err)
 			failed++
@@ -431,6 +492,13 @@ func runRAGIndex(ctx context.Context, st *store.Store, storage client.StorageCli
 			failed++
 			continue
 		}
+		if tables && len(pdfBytes) > 0 {
+			if tn, err := indexFilingTables(ctx, arch, st, ix, settings.StorageParentFolder, co, meta, p, pdfBytes); err != nil {
+				log.Printf("[rag-index] %s: %s: tables: %v", p.Symbol, p.AnalysisSegment, err)
+			} else if tn > 0 {
+				log.Printf("[rag-index] %s: %s: indexed %d tables (period %s)", p.Symbol, p.AnalysisSegment, tn, orDash(meta.Period))
+			}
+		}
 		if err := st.MarkResourceIndexed(ctx, p.CompanyID, p.AnalysisSegment, true); err != nil {
 			log.Printf("[rag-index] %s: %s: mark indexed: %v", p.Symbol, p.AnalysisSegment, err)
 			failed++
@@ -442,14 +510,118 @@ func runRAGIndex(ctx context.Context, st *store.Store, storage client.StorageCli
 	log.Printf("[rag-index] %d resources: %d ok, %d failed", len(pending), len(pending)-failed, failed)
 }
 
+// indexFilingTables mines the archived PDF for financial tables, indexes
+// them into rag_tables and archives the JSON beside the source PDF so the
+// extraction is reusable without re-parsing. Returns the number of indexed
+// table units (0 when the PDF holds no tables).
+func indexFilingTables(ctx context.Context, arch *archivus.ArchivusClient, st *store.Store, ix *rag.Indexer, parentFolder string, co models.Company, meta rag.DocMeta, p store.PendingResource, pdfBytes []byte) (int, error) {
+	tables := ir.ExtractedTables(pdfBytes)
+	if len(tables) == 0 {
+		return 0, nil
+	}
+	n, err := ix.IndexTables(ctx, co, meta, tables)
+	if err != nil {
+		return 0, err
+	}
+	if p.RawDataUrl != "" {
+		name := tablesFileName(p.RawDataUrl)
+		payload, jerr := ir.TablesJSON(p.AnalysisSegment, p.DocumentURL, tables)
+		if jerr != nil {
+			log.Printf("[rag-index] %s: %s: encode tables: %v", p.Symbol, p.AnalysisSegment, jerr)
+			return n, nil
+		}
+		if _, uerr := arch.UploadFile(folderRel(parentFolder, p.RawDataUrl),
+			[]*archivus.UploadFile{{Name: name, Content: payload}}); uerr != nil {
+			log.Printf("[rag-index] %s: %s: tables upload: %v", p.Symbol, p.AnalysisSegment, uerr)
+		} else if rerr := st.RecordResourceTables(ctx, p.CompanyID, p.AnalysisSegment, name,
+			path.Join(folderRel(parentFolder, p.RawDataUrl), name), len(tables)); rerr != nil {
+			log.Printf("[rag-index] %s: %s: record tables path: %v", p.Symbol, p.AnalysisSegment, rerr)
+		}
+	}
+	return n, nil
+}
+
+// tablesFileName derives the archived tables JSON name from the PDF's file
+// name.
+func tablesFileName(pdfPath string) string {
+	name := fileNameOf(pdfPath)
+	if name == "" {
+		return ""
+	}
+	return strings.TrimSuffix(name, ".pdf") + ".tables.json"
+}
+
 const irSource = "investor_relations"
+
+// runRAGTables migrates existing companies to the rag_tables store: every
+// archived filing without a tables file is re-downloaded, mined for
+// financial tables, indexed (embed + insert) and its JSON archived beside
+// the source PDF. Prose chunks and the indexed flags are left untouched, so
+// the migration never re-bills embeddings for chunks. Idempotent: the
+// extracted_data.tables_path it records marks a filing as done.
+func runRAGTables(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings, symbol string, dryRun bool) {
+	arch, ok := storage.(*archivus.ArchivusClient)
+	if !ok {
+		log.Fatal("rag-tables: storage client does not support file lookup")
+	}
+	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+
+	pending, err := st.TableBackfillResources(ctx, symbol)
+	if err != nil {
+		log.Fatalf("rag-tables: %v", err)
+	}
+	if len(pending) == 0 {
+		log.Printf("[rag-tables] every archived filing already has its tables indexed")
+		return
+	}
+	log.Printf("[rag-tables] %d filings to migrate", len(pending))
+	if dryRun {
+		for _, p := range pending {
+			log.Printf("[rag-tables] would process %s: %s (%s)", p.Symbol, p.AnalysisSegment, p.RawDataUrl)
+		}
+		return
+	}
+
+	var failed int
+	for _, p := range pending {
+		start := time.Now()
+		data, err := downloadArchivedFile(arch, settings.StorageParentFolder, p.RawDataUrl)
+		if err != nil {
+			log.Printf("[rag-tables] %s: %s: fetch %s: %v", p.Symbol, p.AnalysisSegment, p.RawDataUrl, err)
+			failed++
+			continue
+		}
+		co := models.Company{BaseModel: models.BaseModel{ID: p.CompanyID}, Symbol: p.Symbol}
+		meta := rag.DocMeta{
+			Segment:     p.AnalysisSegment,
+			DocumentURL: p.DocumentURL,
+			Period:      rag.DerivePeriod(p.AnchorText, p.DocumentURL, ""),
+			Source:      p.Source,
+			IsQuarterly: p.AnalysisSegment == "quarterly_financials",
+		}
+		n, err := indexFilingTables(ctx, arch, st, ix, settings.StorageParentFolder, co, meta, p, data)
+		if err != nil {
+			log.Printf("[rag-tables] %s: %s: FAILED: %v", p.Symbol, p.AnalysisSegment, err)
+			failed++
+			continue
+		}
+		outcome := "no tables found"
+		if n > 0 {
+			outcome = fmt.Sprintf("indexed %d table units", n)
+		}
+		log.Printf("[rag-tables] %s: %s: %s in %s", p.Symbol, p.AnalysisSegment, outcome, time.Since(start).Round(time.Second))
+	}
+	log.Printf("[rag-tables] %d filings: %d ok, %d failed", len(pending), len(pending)-failed, failed)
+}
 
 // filingText fetches the parsed text of an archived filing. The archived PDF
 // is preferred and re-extracted so the text carries [[page N]] markers; the
 // stored text file is the fallback for unreadable PDFs. A successful PDF
 // re-extract is uploaded back to the same location so the archive stays
-// consistent with what was indexed.
-func filingText(arch *archivus.ArchivusClient, parentFolder string, p store.PendingResource) (string, error) {
+// consistent with what was indexed. The PDF bytes are returned alongside the
+// text (nil when only the stored text was available) so table extraction can
+// mine the same file.
+func filingText(arch *archivus.ArchivusClient, parentFolder string, p store.PendingResource) (string, []byte, error) {
 	if p.RawDataUrl != "" {
 		data, err := downloadArchivedFile(arch, parentFolder, p.RawDataUrl)
 		if err == nil {
@@ -461,7 +633,7 @@ func filingText(arch *archivus.ArchivusClient, parentFolder string, p store.Pend
 						log.Printf("[rag-index] %s: %s: refresh text upload: %v", p.Symbol, p.AnalysisSegment, uerr)
 					}
 				}
-				return text, nil
+				return text, data, nil
 			}
 			log.Printf("[rag-index] %s: %s: PDF re-extract empty (%d pages), falling back to stored text",
 				p.Symbol, p.AnalysisSegment, pages)
@@ -472,9 +644,9 @@ func filingText(arch *archivus.ArchivusClient, parentFolder string, p store.Pend
 	}
 	data, err := downloadArchivedFile(arch, parentFolder, p.TextPath)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return string(data), nil
+	return string(data), nil, nil
 }
 
 // downloadArchivedFile fetches one archived file from Archivus. Stored paths
@@ -523,9 +695,10 @@ func orDash(s string) string {
 }
 
 // runRAGSearch runs a hybrid search over one company's indexed filings and
-// prints the ranked chunks. With rerank on, the cross-encoder reorders a
-// deep candidate pool before truncation.
-func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings, symbol, segment, query string, k int, rerank bool) {
+// prints the ranked hits — prose chunks by default, or the extracted
+// financial tables with -tables. With rerank on, the cross-encoder reorders
+// a deep candidate pool before truncation.
+func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings, symbol, segment, query string, k int, rerank, tables bool) {
 	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
 	if rerank {
 		ix = ix.WithReranker(mustReranker(ctx, st, settings, nil), settings.RerankPool)
@@ -537,12 +710,21 @@ func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings
 	if co == nil {
 		log.Fatalf("rag-search: symbol %q not seeded (run: vyasa seed)", symbol)
 	}
-	hits, err := ix.Search(ctx, co.ID, segment, query, k)
+	var hits []models.RAGHit
+	if tables {
+		hits, err = ix.SearchTables(ctx, co.ID, segment, query, k)
+	} else {
+		hits, err = ix.Search(ctx, co.ID, segment, query, k)
+	}
 	if err != nil {
 		log.Fatalf("rag-search: %v", err)
 	}
 	if len(hits) == 0 {
-		fmt.Println("no matching passages")
+		if tables {
+			fmt.Println("no matching tables")
+		} else {
+			fmt.Println("no matching passages")
+		}
 		return
 	}
 	for i, h := range hits {
@@ -554,16 +736,113 @@ func runRAGSearch(ctx context.Context, st *store.Store, settings config.Settings
 			label += " [quarterly]"
 		}
 		section := ""
-		if h.Section != "" {
+		if tables {
+			caption := h.Section
+			if caption == "" {
+				caption = "untitled table"
+			}
+			section = fmt.Sprintf(" — table %q, page %d", caption, h.Offset)
+		} else if h.Section != "" {
 			section = " — " + h.Section
 		}
 		score := fmt.Sprintf("score %.4f", h.Score)
 		if h.Reranked {
 			score = fmt.Sprintf("rerank %.4f (rrf %.4f)", h.RerankScore, h.Score)
 		}
+		text := h.Text
+		if tables {
+			text = truncateRunesCmd(text, tableHitRunes)
+		}
 		fmt.Printf("[%d] %s — %s %s%s\n%s\nsource: %s\n\n",
-			i+1, score, h.Symbol, label, section, h.Text, h.DocumentURL)
+			i+1, score, h.Symbol, label, section, text, h.DocumentURL)
 	}
+}
+
+// tableHitRunes caps how much of a table's markdown the CLI may print.
+const tableHitRunes = 1600
+
+// truncateRunesCmd cuts s to at most n runes at a word boundary.
+func truncateRunesCmd(s string, n int) string {
+	r := []rune(s)
+	if n <= 0 || len(r) <= n {
+		return s
+	}
+	cut := string(r[:n])
+	if i := strings.LastIndexAny(cut, " \n\t"); i > n/2 {
+		return strings.TrimRight(cut[:i], " \n\t")
+	}
+	return cut
+}
+
+// parseSymbols splits the -symbol list, trims it and dedupes it. Unlike
+// parseSources the values keep their case: symbols are case-sensitive
+// (M&M, WAAREEENER).
+func parseSymbols(list string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, s := range strings.Split(list, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// runMetrics derives the per-FY key metrics from the latest annual statement
+// snapshots and upserts them into ticker_metrics. With no -symbol list it
+// recomputes every symbol that has statement data.
+func runMetrics(ctx context.Context, st *store.Store, symbols []string) {
+	if len(symbols) == 0 {
+		var err error
+		symbols, err = st.MetricsSymbols(ctx)
+		if err != nil {
+			log.Fatalf("metrics: %v", err)
+		}
+		if len(symbols) == 0 {
+			log.Printf("[metrics] no statement data to compute from (run: vyasa collect)")
+			return
+		}
+		log.Printf("[metrics] %d symbols with statement data", len(symbols))
+	}
+
+	var okCount, skipped, failed int
+	for _, sym := range symbols {
+		co, err := st.GetCompany(ctx, sym)
+		if err != nil {
+			log.Fatalf("metrics: %v", err)
+		}
+		if co == nil {
+			co = &models.Company{Symbol: sym}
+		}
+		rows, err := metrics.Compute(ctx, st, *co)
+		if err != nil {
+			log.Printf("[metrics] %s: FAILED: %v", sym, err)
+			failed++
+			continue
+		}
+		if len(rows) == 0 {
+			log.Printf("[metrics] %s: no statement data, skipping", sym)
+			skipped++
+			continue
+		}
+		if err := st.UpsertMetrics(ctx, rows); err != nil {
+			log.Printf("[metrics] %s: FAILED: %v", sym, err)
+			failed++
+			continue
+		}
+		gapped := 0
+		for _, r := range rows {
+			if len(r.DataGaps) > 0 {
+				gapped++
+			}
+		}
+		log.Printf("[metrics] %s: %d FYs stored (%d with gaps)", sym, len(rows), gapped)
+		okCount++
+	}
+	log.Printf("[metrics] %d symbols: %d ok, %d skipped, %d failed", len(symbols), okCount, skipped, failed)
 }
 
 // runRAGEvalGen drafts the golden retrieval-eval dataset: it samples indexed
@@ -652,4 +931,92 @@ func parseKs(spec string) ([]int, error) {
 	}
 	sort.Ints(out)
 	return out, nil
+}
+
+// runResearch executes the equity research workflow for one company. The
+// whole agent trace (runs, steps, tool calls, streamed text, usage) is
+// persisted to session_logs under one session id and rendered on the
+// terminal; the report plus where it was persisted is printed at the end.
+func runResearch(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings, symbol, outDir string, steps int, stream, quiet bool, budgetUSD float64) {
+	ai, err := llm.NewClient(settings.Provider, mustLLM(settings))
+	if err != nil {
+		log.Fatalf("research: %v", err)
+	}
+	ix := rag.NewIndexer(st, mustEmbedder(settings), settings.EmbeddingModel, settings.EmbeddingDim)
+	if settings.RerankOn() {
+		ix = ix.WithReranker(mustReranker(ctx, st, settings, nil), settings.RerankPool)
+	}
+
+	sess := session.New(ctx, st, map[string]any{
+		"command":    "research",
+		"symbol":     symbol,
+		"model":      settings.Model,
+		"stream":     stream,
+		"budget_usd": budgetUSD,
+	})
+	summary := map[string]any{"command": "research", "symbol": symbol, "model": settings.Model}
+
+	sinks := []agent.EventSink{sess.Sink()}
+	if !quiet {
+		sinks = append(sinks, session.TerminalSink())
+	}
+
+	res, err := research.Run(ctx, research.Deps{
+		St:            st,
+		Client:        ai,
+		Indexer:       ix,
+		Storage:       storage,
+		Model:         settings.Model,
+		ParentFolder:  settings.StorageParentFolder,
+		StepLimit:     steps,
+		Stream:        stream,
+		Sink:          session.Tee(sinks...),
+		CostBudgetUSD: budgetUSD,
+	}, symbol)
+	if err != nil {
+		summary["status"] = string(agent.FinishError)
+		summary["error"] = err.Error()
+		sess.Close(summary)
+		log.Fatalf("research: %v", err)
+	}
+
+	summary["status"] = string(res.Finish)
+	summary["steps"] = res.Steps
+	summary["usage"] = session.UsageSummary(res.Usage)
+	summary["report_id"] = res.Report.ID
+	summary["report_file"] = res.FilePath
+	if res.Report.ArchivedPath != "" {
+		summary["report_archived"] = res.Report.ArchivedPath
+	}
+	if res.BudgetLimit > 0 {
+		summary["budget_spent_usd"] = res.BudgetSpent
+	}
+	if len(res.Warnings) > 0 {
+		summary["warnings"] = res.Warnings
+	}
+	sess.Close(summary)
+
+	log.Printf("[research] session %s persisted (%s)", sess.ID(), summary["status"])
+	log.Printf("[research] %s: report id %s, %d question(s) asked", symbol, res.Report.ID, len(res.Report.Questions))
+	log.Printf("[research] markdown: %s", res.FilePath)
+	if res.Report.ArchivedPath != "" {
+		log.Printf("[research] archived: %s", res.Report.ArchivedPath)
+	}
+	log.Printf("[research] usage: %d steps, in %d tok, out %d tok, cached %d tok",
+		res.Steps, res.Usage.InputTokens, res.Usage.OutputTokens, res.Usage.CachedTokens)
+	if res.Usage.Cost != nil {
+		log.Printf("[research] cost: $%.4f", *res.Usage.Cost)
+	}
+	if res.BudgetLimit > 0 {
+		log.Printf("[research] cost budget: $%.4f spent of $%.4f (exhausted: %v)",
+			res.BudgetSpent, res.BudgetLimit, res.BudgetExhausted)
+	}
+	for _, w := range res.Warnings {
+		log.Printf("[research] warning: %s", w)
+	}
+	if res.Finish != agent.FinishCompleted {
+		log.Printf("[research] warning: synthesizer finished with %s — report may be partial", res.Finish)
+	}
+	fmt.Println()
+	fmt.Println(res.Report.ReportMD)
 }

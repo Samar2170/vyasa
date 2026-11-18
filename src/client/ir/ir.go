@@ -11,6 +11,10 @@
 // upserted into the company_research_resources table, keyed by
 // (company_id, analysis_segment), holding the source link, the archived PDF
 // path and the parsed-text path.
+//
+// Financial tables mined from each PDF (see tables.go) are archived as JSON
+// beside the other filing files and indexed into the separate rag_tables
+// store, so structured numbers stay retrievable independently of the prose.
 package ir
 
 import (
@@ -100,16 +104,18 @@ type filing struct {
 
 // filingResult is one downloaded, archived and parsed filing.
 type filingResult struct {
-	Segment   string
-	PDFName   string
-	TxtName   string
-	SourceURL string
-	PageURL   string
-	Anchor    string
-	Pages     int
-	TextChars int
-	PDF       []byte
-	Text      string
+	Segment    string
+	PDFName    string
+	TxtName    string
+	TablesName string
+	SourceURL  string
+	PageURL    string
+	Anchor     string
+	Pages      int
+	TextChars  int
+	PDF        []byte
+	Text       string
+	Tables     []rag.ExtractedTable
 }
 
 // Execute runs the whole pipeline for one company: resolve links, discover
@@ -187,16 +193,18 @@ func (c *Client) fetchAndParse(ctx context.Context, co models.Company, picks map
 				log.Printf("[ir] %s: %s: pdf at %s has no readable text", co.Symbol, seg, used.URL)
 			}
 			results[i] = filingResult{
-				Segment:   seg,
-				PDFName:   docName(co.Symbol, seg, "pdf", day),
-				TxtName:   docName(co.Symbol, seg, "txt", day),
-				SourceURL: used.URL,
-				PageURL:   used.PageURL,
-				Anchor:    used.Text,
-				Pages:     pages,
-				TextChars: len(text),
-				PDF:       data,
-				Text:      text,
+				Segment:    seg,
+				PDFName:    docName(co.Symbol, seg, "pdf", day),
+				TxtName:    docName(co.Symbol, seg, "txt", day),
+				TablesName: docName(co.Symbol, seg, "tables.json", day),
+				SourceURL:  used.URL,
+				PageURL:    used.PageURL,
+				Anchor:     used.Text,
+				Pages:      pages,
+				TextChars:  len(text),
+				PDF:        data,
+				Text:       text,
+				Tables:     extractPDFTables(data),
 			}
 		}(i, seg, list)
 	}
@@ -251,10 +259,20 @@ func (c *Client) expandedListing(ctx context.Context, co models.Company, seg str
 	return found
 }
 
+// tablesPayload is the archived JSON form of one filing's extracted tables.
+type tablesPayload struct {
+	Segment     string               `json:"segment"`
+	SourceURL   string               `json:"source_url"`
+	GeneratedAt time.Time            `json:"generated_at"`
+	Tables      []rag.ExtractedTable `json:"tables"`
+}
+
 // archiveAndRecord uploads the PDFs and their parsed text to the same
 // storage folder, then records paths in company_research_resources and
-// saved_files. A failed upload skips that segment (logged) instead of
-// aborting the run; the error is only fatal when nothing uploaded at all.
+// saved_files. Extracted tables are archived beside them as JSON and
+// indexed into the separate rag_tables store. A failed upload skips that
+// segment (logged) instead of aborting the run; the error is only fatal
+// when nothing uploaded at all.
 func (c *Client) archiveAndRecord(ctx context.Context, co models.Company, results []filingResult) error {
 	if c.storage == nil {
 		return fmt.Errorf("storage not configured")
@@ -262,6 +280,7 @@ func (c *Client) archiveAndRecord(ctx context.Context, co models.Company, result
 	folder := path.Join(co.Symbol, storageSubFolder)
 
 	byName := make(map[string]string, 2*len(results))
+	tablesSize := make(map[string]float64, len(results))
 	uploadErrs := make(map[string]string, len(results))
 	// one file per upload request: big PDFs take minutes on slow links and a
 	// single stalled file must not sink the rest of the batch
@@ -282,6 +301,24 @@ func (c *Client) archiveAndRecord(ctx context.Context, co models.Company, result
 		}
 		for _, p := range txtPaths {
 			byName[p.Name] = path.Join(p.FolderPath, p.Name)
+		}
+		if len(r.Tables) > 0 {
+			payload, err := json.Marshal(tablesPayload{
+				Segment:     r.Segment,
+				SourceURL:   r.SourceURL,
+				GeneratedAt: time.Now(),
+				Tables:      r.Tables,
+			})
+			if err != nil {
+				log.Printf("[ir] %s: encode %s FAILED: %v", co.Symbol, r.TablesName, err)
+			} else if tblPaths, err := c.storage.UploadFile(folder, []*archivus.UploadFile{{Name: r.TablesName, Content: payload}}); err != nil {
+				log.Printf("[ir] %s: upload %s FAILED: %v", co.Symbol, r.TablesName, err)
+			} else {
+				tablesSize[r.TablesName] = float64(len(payload))
+				for _, p := range tblPaths {
+					byName[p.Name] = path.Join(p.FolderPath, p.Name)
+				}
+			}
 		}
 	}
 
@@ -306,6 +343,11 @@ func (c *Client) archiveAndRecord(ctx context.Context, co models.Company, result
 			"anchor_text":   r.Anchor,
 			"parsed_at":     time.Now(),
 			"storage_class": storageSubFolder,
+		}
+		if tablesPath := byName[r.TablesName]; tablesPath != "" && len(r.Tables) > 0 {
+			extracted["tables_name"] = r.TablesName
+			extracted["tables_path"] = tablesPath
+			extracted["table_count"] = len(r.Tables)
 		}
 		if errMsg, ok := uploadErrs[r.Segment]; ok {
 			extracted["upload_error"] = errMsg
@@ -339,6 +381,14 @@ func (c *Client) archiveAndRecord(ctx context.Context, co models.Company, result
 					log.Printf("[ir] %s: %s: index: %v", co.Symbol, r.Segment, err)
 				} else {
 					log.Printf("[ir] %s: %s: indexed %d chunks (period %s)", co.Symbol, r.Segment, n, orDefault(meta.Period, "-"))
+					if len(r.Tables) > 0 {
+						tn, err := c.indexer.IndexTables(ctx, co, meta, r.Tables)
+						if err != nil {
+							log.Printf("[ir] %s: %s: index tables: %v", co.Symbol, r.Segment, err)
+						} else {
+							log.Printf("[ir] %s: %s: indexed %d tables (period %s)", co.Symbol, r.Segment, tn, orDefault(meta.Period, "-"))
+						}
+					}
 					if err := c.store.MarkResourceIndexed(ctx, co.ID, r.Segment, true); err != nil {
 						log.Printf("[ir] %s: %s: mark indexed: %v", co.Symbol, r.Segment, err)
 					}
@@ -347,7 +397,11 @@ func (c *Client) archiveAndRecord(ctx context.Context, co models.Company, result
 			if err := c.upsertSavedFile(ctx, co, r.TxtName, folderOf(txtPath), "txt", float64(r.TextChars)); err != nil {
 				return err
 			}
-
+		}
+		if tablesPath := byName[r.TablesName]; tablesPath != "" && len(r.Tables) > 0 {
+			if err := c.upsertSavedFile(ctx, co, r.TablesName, folderOf(tablesPath), "json", tablesSize[r.TablesName]); err != nil {
+				return err
+			}
 		}
 	}
 	return firstErr
