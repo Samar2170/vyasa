@@ -120,30 +120,35 @@ Reuses `types.Tool` / `types.Registry` and `llm.ToolSpecs` (src/llm/tools.go).
 type EventKind string
 
 const (
-    EventStepStart EventKind = "step_start"
-    EventLLMStart  EventKind = "llm_start"
-    EventTextDelta EventKind = "text_delta"
-    EventToolCall  EventKind = "tool_call"      // requested by model
+    EventRunStart   EventKind = "run_start"      // emitted when a run begins (carries the run input)
+    EventStepStart  EventKind = "step_start"
+    EventLLMStart   EventKind = "llm_start"
+    EventTextDelta  EventKind = "text_delta"
+    EventToolCall   EventKind = "tool_call"      // requested by model
     EventToolResult EventKind = "tool_result"
-    EventAgentDone EventKind = "agent_done"
+    EventAgentDone  EventKind = "agent_done"
 )
 
 type Event struct {
-    Kind      EventKind
-    RunID     string
-    ParentID  string          // set for sub-agent runs
-    Step      int
-    Text      string          // delta or final text
-    ToolCall  *llm.ToolCall
+    Kind       EventKind
+    RunID      string
+    ParentID   string          // set for sub-agent runs
+    Agent      string          // name of the agent that produced the event
+    Step       int
+    Text       string          // run input, delta or final text
+    ToolCall   *llm.ToolCall
     ToolOutput *types.ExecutionOutput
-    Usage     *llm.Usage
-    Err       error
+    Usage      *llm.Usage
+    Finish     FinishStatus    // set on agent_done
+    Err        error
 }
 
 type EventSink func(Event)
 ```
 
 Event emission is the only side effect of the loop besides tool execution. CLI, persistence, and the orchestrator all consume the same stream.
+
+The stream is persisted as-is by `src/session`: one `vyasa research` invocation is a session; every event becomes one `session_logs` row with the event-specific data in a jsonb `payload` column (`run_id`/`parent_id` reconstruct the delegation tree). The same sink fans out to a verbose terminal renderer.
 
 ---
 
@@ -226,7 +231,7 @@ Session
     └── delegate call → specialist run A (second round)
 ```
 
-- Every `Event` carries `RunID`/`ParentID`, so the full trace (LLM reasoning, tool calls + outputs, usage per step) can be persisted as a flat event log and reconstructed as a tree — the "action persistence" module from prompts.md.
+- Every `Event` carries `RunID`/`ParentID`, so the full trace (LLM reasoning, tool calls + outputs, usage per step) is persisted as a flat event log (`session_logs`, via `src/session`) and reconstructed as a tree — the "action persistence" module from prompts.md.
 - `Result.Usage` aggregates over steps; session usage aggregates over runs (sum, cached tokens included — `llm.Usage` already has `CachedTokens`/`Cost`).
 
 ---

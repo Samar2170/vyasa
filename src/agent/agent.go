@@ -80,12 +80,15 @@ func (a *Agent) Run(ctx context.Context, client llm.ModelClient, systemPrompt st
 	emit := func(e Event) {
 		e.RunID = runID
 		e.ParentID = cfg.parentID
+		e.Agent = a.Name
 		cfg.sink(e)
 	}
 	result := Result{Finish: FinishMaxSteps}
 	defer func() {
-		emit(Event{Kind: EventAgentDone, Step: result.Steps, Text: result.FinalText, Usage: &result.Usage, Err: result.Err})
+		emit(Event{Kind: EventAgentDone, Step: result.Steps, Text: result.FinalText, Usage: &result.Usage, Finish: result.Finish, Err: result.Err})
 	}()
+
+	emit(Event{Kind: EventRunStart, Text: input})
 
 	// The run context carries run identity so delegate tools can link
 	// sub-runs into the trace tree and forward events. The parent for

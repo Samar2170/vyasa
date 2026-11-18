@@ -449,6 +449,28 @@ CREATE INDEX IF NOT EXISTS research_reports_lookup
 	ON research_reports (symbol, created_at DESC);
 `
 
+// sessionLogsSchema is the flat agent event log: one row per emitted event,
+// with the event-specific data (run input, streamed text, tool call +
+// output, usage, error) in the payload jsonb column. A session is the
+// events of one CLI invocation grouped by session_id; run_id/parent_id
+// reconstruct the delegation tree.
+const sessionLogsSchema = `
+CREATE TABLE IF NOT EXISTS session_logs (
+	id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+	session_id text NOT NULL,
+	seq integer NOT NULL,
+	run_id text NOT NULL DEFAULT '',
+	parent_id text NOT NULL DEFAULT '',
+	agent text NOT NULL DEFAULT '',
+	kind text NOT NULL,
+	step integer NOT NULL DEFAULT 0,
+	payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+	created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS session_logs_lookup
+	ON session_logs (session_id, seq);
+`
+
 // Migrate creates the schema if it does not exist yet.
 func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.Pool.Exec(ctx, schema); err != nil {
@@ -468,6 +490,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.Pool.Exec(ctx, researchReportsSchema); err != nil {
 		return fmt.Errorf("store: migrate research_reports: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, sessionLogsSchema); err != nil {
+		return fmt.Errorf("store: migrate session_logs: %w", err)
 	}
 
 	for _, table := range tickerSectionTables() {

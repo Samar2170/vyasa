@@ -212,9 +212,9 @@ func runOpts(d Deps) []agent.RunOption {
 	}
 	if d.Sink != nil {
 		opts = append(opts, agent.WithEvents(d.Sink))
-		if d.Stream {
-			opts = append(opts, agent.WithStream())
-		}
+	}
+	if d.Stream {
+		opts = append(opts, agent.WithStream())
 	}
 	return opts
 }

@@ -35,6 +35,7 @@ import (
 	"vyasa/src/models"
 	"vyasa/src/rag"
 	"vyasa/src/research"
+	"vyasa/src/session"
 	"vyasa/src/store"
 )
 
@@ -148,14 +149,15 @@ func main() {
 		symbol := fs.String("symbol", "", "company symbol to research")
 		out := fs.String("out", "reports", "directory for the markdown report")
 		steps := fs.Int("steps", 0, "optional per-agent step-limit override")
-		stream := fs.Bool("stream", false, "stream agent text deltas to the terminal")
+		stream := fs.Bool("stream", true, "stream agent text deltas to the terminal (-stream=false to disable)")
+		quiet := fs.Bool("quiet", false, "suppress the live agent trace (session logging to PostgreSQL still runs)")
 		budget := fs.Float64("budget", settings.ResearchCostBudget, "cost budget for the whole workflow in USD (0 = unlimited; default from config.json research_cost_budget)")
 		_ = fs.Parse(os.Args[2:])
 		if *symbol == "" {
 			log.Fatal("research requires -symbol SYMBOL")
 		}
 		storage := mustArchivus(settings)
-		runResearch(ctx, st, storage, settings, *symbol, *out, *steps, *stream, *budget)
+		runResearch(ctx, st, storage, settings, *symbol, *out, *steps, *stream, *quiet, *budget)
 	default:
 		usage()
 	}
@@ -198,7 +200,9 @@ commands:
   research  run the equity research workflow for one company (metrics
             analysis, annual report, investor presentation, synthesis with
             clarifying Q&A; saves the markdown report to DB, file and
-            Archivus): -symbol RELIANCE [-out reports] [-steps N] [-stream]`)
+            Archivus). The whole agent trace streams to the terminal and is
+            persisted to the session_logs table: -symbol RELIANCE
+            [-out reports] [-steps N] [-stream=false] [-quiet] [-budget N]`)
 	os.Exit(2)
 }
 
@@ -929,9 +933,11 @@ func parseKs(spec string) ([]int, error) {
 	return out, nil
 }
 
-// runResearch executes the equity research workflow for one company and
-// prints the report plus where it was persisted.
-func runResearch(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings, symbol, outDir string, steps int, stream bool, budgetUSD float64) {
+// runResearch executes the equity research workflow for one company. The
+// whole agent trace (runs, steps, tool calls, streamed text, usage) is
+// persisted to session_logs under one session id and rendered on the
+// terminal; the report plus where it was persisted is printed at the end.
+func runResearch(ctx context.Context, st *store.Store, storage client.StorageClient, settings config.Settings, symbol, outDir string, steps int, stream, quiet bool, budgetUSD float64) {
 	ai, err := llm.NewClient(settings.Provider, mustLLM(settings))
 	if err != nil {
 		log.Fatalf("research: %v", err)
@@ -941,9 +947,18 @@ func runResearch(ctx context.Context, st *store.Store, storage client.StorageCli
 		ix = ix.WithReranker(mustReranker(ctx, st, settings, nil), settings.RerankPool)
 	}
 
-	var sink agent.EventSink
-	if stream {
-		sink = streamSink()
+	sess := session.New(ctx, st, map[string]any{
+		"command":    "research",
+		"symbol":     symbol,
+		"model":      settings.Model,
+		"stream":     stream,
+		"budget_usd": budgetUSD,
+	})
+	summary := map[string]any{"command": "research", "symbol": symbol, "model": settings.Model}
+
+	sinks := []agent.EventSink{sess.Sink()}
+	if !quiet {
+		sinks = append(sinks, session.TerminalSink())
 	}
 
 	res, err := research.Run(ctx, research.Deps{
@@ -955,13 +970,33 @@ func runResearch(ctx context.Context, st *store.Store, storage client.StorageCli
 		ParentFolder:  settings.StorageParentFolder,
 		StepLimit:     steps,
 		Stream:        stream,
-		Sink:          sink,
+		Sink:          session.Tee(sinks...),
 		CostBudgetUSD: budgetUSD,
 	}, symbol)
 	if err != nil {
+		summary["status"] = string(agent.FinishError)
+		summary["error"] = err.Error()
+		sess.Close(summary)
 		log.Fatalf("research: %v", err)
 	}
 
+	summary["status"] = string(res.Finish)
+	summary["steps"] = res.Steps
+	summary["usage"] = session.UsageSummary(res.Usage)
+	summary["report_id"] = res.Report.ID
+	summary["report_file"] = res.FilePath
+	if res.Report.ArchivedPath != "" {
+		summary["report_archived"] = res.Report.ArchivedPath
+	}
+	if res.BudgetLimit > 0 {
+		summary["budget_spent_usd"] = res.BudgetSpent
+	}
+	if len(res.Warnings) > 0 {
+		summary["warnings"] = res.Warnings
+	}
+	sess.Close(summary)
+
+	log.Printf("[research] session %s persisted (%s)", sess.ID(), summary["status"])
 	log.Printf("[research] %s: report id %s, %d question(s) asked", symbol, res.Report.ID, len(res.Report.Questions))
 	log.Printf("[research] markdown: %s", res.FilePath)
 	if res.Report.ArchivedPath != "" {
@@ -984,24 +1019,4 @@ func runResearch(ctx context.Context, st *store.Store, storage client.StorageCli
 	}
 	fmt.Println()
 	fmt.Println(res.Report.ReportMD)
-}
-
-// streamSink renders agent events for the terminal: text deltas inline,
-// tool calls and run completions as short lines.
-func streamSink() agent.EventSink {
-	var mu sync.Mutex
-	return func(e agent.Event) {
-		mu.Lock()
-		defer mu.Unlock()
-		switch e.Kind {
-		case agent.EventTextDelta:
-			fmt.Print(e.Text)
-		case agent.EventToolCall:
-			if e.ToolCall != nil {
-				fmt.Printf("\n→ %s\n", e.ToolCall.Name)
-			}
-		case agent.EventAgentDone:
-			fmt.Println()
-		}
-	}
 }

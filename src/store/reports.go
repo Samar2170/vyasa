@@ -13,9 +13,9 @@ import (
 // links for a company id, or nil when none were recorded.
 func (s *Store) CompanyLinks(ctx context.Context, companyID string) (*models.CompanyLinks, error) {
 	var l models.CompanyLinks
-	err := s.Pool.QueryRow(ctx, `SELECT id, company_id, official_website, investor_relations_link, created_at, updated_at
+	err := s.Pool.QueryRow(ctx, `SELECT company_id, official_website, investor_relations_link, created_at, updated_at
 		FROM company_links WHERE company_id = $1 LIMIT 1`, companyID).
-		Scan(&l.ID, &l.CompanyID, &l.OfficialWebsite, &l.InvestorRelationsLink, &l.CreatedAt, &l.UpdatedAt)
+		Scan(&l.CompanyID, &l.OfficialWebsite, &l.InvestorRelationsLink, &l.CreatedAt, &l.UpdatedAt)
 	if IsNotFound(err) {
 		return nil, nil
 	}

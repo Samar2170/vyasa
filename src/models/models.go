@@ -16,6 +16,7 @@ const (
 	TableRAGChunks       = "rag_chunks"
 	TableRAGTables       = "rag_tables"
 	TableResearchReports = "research_reports"
+	TableSessionLogs     = "session_logs"
 )
 
 // HitKindTable marks a RAGHit that was retrieved from the rag_tables store
@@ -164,4 +165,21 @@ type ResearchReport struct {
 	Questions    []QAPair       `json:"questions,omitempty"`
 	Usage        map[string]any `json:"usage,omitempty"`
 	ArchivedPath string         `json:"archived_path,omitempty"`
+}
+
+// SessionEvent is one row of the agent event stream persisted in
+// session_logs: everything an agent run emits (run boundaries, steps, tool
+// calls + outputs, streamed text, usage) lands here with the
+// event-specific data inside the payload jsonb column. Rows form a flat
+// event log that reconstructs the delegation tree via run_id/parent_id
+// (see src/agent/DESIGN.md §5); seq orders the events within a session.
+type SessionEvent struct {
+	SessionID string         `json:"session_id"`
+	Seq       int            `json:"seq"`
+	RunID     string         `json:"run_id,omitempty"`
+	ParentID  string         `json:"parent_id,omitempty"`
+	Agent     string         `json:"agent,omitempty"`
+	Kind      string         `json:"kind"`
+	Step      int            `json:"step"`
+	Payload   map[string]any `json:"payload,omitempty"`
 }
