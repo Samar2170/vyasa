@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"vyasa/src/llm"
+	"vyasa/src/prompts"
 	"vyasa/src/store"
 )
 
@@ -54,22 +55,6 @@ var (
 
 	knownStyles = map[string]bool{"lookup": true, "numeric": true, "period": true, "qualitative": true}
 )
-
-// genSystemPrompt instructs the model to turn one chunk into one
-// self-contained retrieval question plus its answer.
-const genSystemPrompt = `You write evaluation questions for a financial-filings retrieval benchmark.
-You are given one excerpt from a listed Indian company's investor filing.
-Produce ONE question whose answer is contained in the excerpt.
-
-Rules:
-- Make the question self-contained: name the company, and include the fiscal period when the fact is period-specific.
-- The question must be answerable from the excerpt alone; never require outside knowledge.
-- Prefer concrete facts: revenue, margin, capex, capacity, orders, dividend, growth, plants, debt, headcount, segment split.
-- Paraphrase; do not copy long phrases verbatim from the excerpt.
-- Never refer to the excerpt, the document, the report, the filing or "the text".
-
-Reply with strict JSON only, no commentary:
-{"question": "...", "answer": "...", "style": "lookup"|"numeric"|"period"|"qualitative"}`
 
 // Generate builds a draft golden dataset: it samples question-worthy chunks
 // across (symbol, segment) groups, asks the model to write one grounded
@@ -254,14 +239,13 @@ func writeQuestion(ctx context.Context, client llm.ModelClient, job genJob) (Ite
 	if len(excerpt) > 2500 {
 		excerpt = excerpt[:2500]
 	}
-	user := fmt.Sprintf("Company: %s (symbol %s)\nSegment: %s\nPeriod: %s\nExcerpt:\n<<<\n%s\n>>>",
-		orUnnamed(job.name), s.Symbol, s.Segment, orUnnamed(s.Period), string(excerpt))
+	user := prompts.QuestionUser(orUnnamed(job.name), s.Symbol, s.Segment, orUnnamed(s.Period), string(excerpt))
 
 	temp := 0.2
 	maxTokens := 800
 	resp, err := client.Complete(ctx, llm.Request{
 		Messages: []llm.Message{
-			{Role: llm.RoleSystem, Parts: []llm.Part{{Kind: llm.PartText, Text: genSystemPrompt}}},
+			{Role: llm.RoleSystem, Parts: []llm.Part{{Kind: llm.PartText, Text: prompts.QuestionWriter}}},
 			{Role: llm.RoleUser, Parts: []llm.Part{{Kind: llm.PartText, Text: user}}},
 		},
 		Temperature: &temp,

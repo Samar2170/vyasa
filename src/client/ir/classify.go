@@ -16,6 +16,7 @@ import (
 
 	"vyasa/src/llm"
 	"vyasa/src/models"
+	"vyasa/src/prompts"
 
 	"golang.org/x/net/html"
 )
@@ -796,15 +797,8 @@ func (c *Client) llmAssist(ctx context.Context, co models.Company, cands []candi
 			segDesc += "\n- quarterly_financials: the latest quarterly financial results filing"
 		}
 	}
-	system := "You are a precise research assistant. Reply with strict JSON only, no commentary."
-	user := fmt.Sprintf(`Company %q (BSE symbol %s). Below are links from its investor relations pages. Pick the index (the number before the dot) of the best link for each of these segments:%s
-
-Links:
-%s
-
-Reply with JSON mapping each segment to the chosen index or null, e.g. {"annual_report": 3, "investor_presentation": null, "earnings_call_transcript": null, "quarterly_financials": 7}. Only use indexes from the list. Prefer the most recent document.`, name, co.Symbol, segDesc, b.String())
 	var out map[string]any
-	if err := c.chatJSON(ctx, system, user, &out); err != nil {
+	if err := c.chatJSON(ctx, prompts.JSONAssistant, prompts.IRClassifyUser(name, co.Symbol, segDesc, b.String()), &out); err != nil {
 		log.Printf("[ir] %s: llm classification failed: %v", co.Symbol, err)
 		return picks
 	}

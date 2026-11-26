@@ -13,6 +13,7 @@ import (
 
 	"vyasa/src/llm"
 	"vyasa/src/models"
+	"vyasa/src/prompts"
 
 	"golang.org/x/net/html"
 )
@@ -134,15 +135,11 @@ func (c *Client) llmLinks(ctx context.Context, co models.Company) linkSet {
 	if name == "" {
 		name = co.Symbol
 	}
-	system := "You are a precise research assistant. Reply with strict JSON only, no commentary."
-	user := fmt.Sprintf(`What are the official website and the investor relations page of the Indian listed company %q (BSE symbol %s)?
-Reply with JSON: {"website": "https://... or null", "investor_relations": "https://... or null"}
-Only give URLs you are confident about. The investor relations page is the section hosting annual reports, investor presentations and quarterly results.`, name, co.Symbol)
 	var out struct {
 		Website           string `json:"website"`
 		InvestorRelations string `json:"investor_relations"`
 	}
-	if err := c.chatJSON(ctx, system, user, &out); err != nil {
+	if err := c.chatJSON(ctx, prompts.JSONAssistant, prompts.IRLinksUser(name, co.Symbol), &out); err != nil {
 		log.Printf("[ir] %s: llm link guess failed: %v", co.Symbol, err)
 		return linkSet{}
 	}

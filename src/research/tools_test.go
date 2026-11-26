@@ -267,17 +267,3 @@ func TestFallbackReport(t *testing.T) {
 		}
 	}
 }
-
-func TestPromptsNonEmpty(t *testing.T) {
-	for name, p := range map[string]string{
-		"financial":    financialAnalystPrompt,
-		"annual":       annualReportPrompt,
-		"presentation": presentationPrompt,
-		"verifier":     verifierPrompt,
-		"synthesizer":  synthesizerPrompt,
-	} {
-		if strings.TrimSpace(p) == "" {
-			t.Errorf("%s prompt is empty", name)
-		}
-	}
-}

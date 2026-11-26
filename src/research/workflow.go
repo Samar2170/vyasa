@@ -16,6 +16,7 @@ import (
 	"vyasa/src/llm"
 	"vyasa/src/metrics"
 	"vyasa/src/models"
+	"vyasa/src/prompts"
 	"vyasa/src/rag"
 	"vyasa/src/store"
 	"vyasa/src/types"
@@ -83,9 +84,9 @@ func Run(ctx context.Context, d Deps, symbol string) (*Result, error) {
 		task  string
 		agent *agent.Agent
 	}{
-		{"financial_analyst", specialistTask("financial_analyst", co), newFinancialAnalyst(d, facts)},
-		{"annual_report_analyst", specialistTask("annual_report_analyst", co), newAnnualReportAnalyst(d, facts)},
-		{"presentation_analyst", specialistTask("presentation_analyst", co), newPresentationAnalyst(d, facts)},
+		{"financial_analyst", prompts.SpecialistTask("financial_analyst", co), newFinancialAnalyst(d, facts)},
+		{"annual_report_analyst", prompts.SpecialistTask("annual_report_analyst", co), newAnnualReportAnalyst(d, facts)},
+		{"presentation_analyst", prompts.SpecialistTask("presentation_analyst", co), newPresentationAnalyst(d, facts)},
 	}
 
 	findings := make([]string, len(specs))
@@ -135,7 +136,7 @@ func Run(ctx context.Context, d Deps, symbol string) (*Result, error) {
 	}
 
 	synth := newSynthesizer(d, ask, facts)
-	res, err := synth.Run(runCtx, client, "", synthesisInput(co, findings), runOpts(d)...)
+	res, err := synth.Run(runCtx, client, "", prompts.SynthesisInput(co, findings), runOpts(d)...)
 	if err != nil && errors.Is(err, llm.ErrCostBudgetExhausted) {
 		// The budget ran out before synthesis could run: persist the raw
 		// findings as a partial report instead of losing the spend.
@@ -223,7 +224,7 @@ func newAnnualReportAnalyst(d Deps, facts []string) *agent.Agent {
 	return &agent.Agent{
 		Name:         "annual_report_analyst",
 		Description:  "Reads the company's archived annual report: business, reported statements, MD&A, risks.",
-		SystemPrompt: annualReportPrompt,
+		SystemPrompt: prompts.AnnualReportAnalyst,
 		Facts:        facts,
 		Model:        d.Model,
 		Tools:        scopedRAGRegistry(d, segmentAnnual, "annual", "annual report"),
@@ -281,7 +282,7 @@ func newFinancialAnalyst(d Deps, facts []string) *agent.Agent {
 	return &agent.Agent{
 		Name:         "financial_analyst",
 		Description:  "Analyzes computed financial metrics by fiscal year (growth, margins, returns, solvency, cash flow).",
-		SystemPrompt: financialAnalystPrompt,
+		SystemPrompt: prompts.FinancialAnalyst,
 		Facts:        facts,
 		Model:        d.Model,
 		Tools:        reg,
@@ -293,7 +294,7 @@ func newPresentationAnalyst(d Deps, facts []string) *agent.Agent {
 	return &agent.Agent{
 		Name:         "presentation_analyst",
 		Description:  "Reads the company's archived investor presentations: headline claims, guidance, capex plans.",
-		SystemPrompt: presentationPrompt,
+		SystemPrompt: prompts.PresentationAnalyst,
 		Facts:        facts,
 		Model:        d.Model,
 		Tools:        scopedRAGRegistry(d, segmentPresentation, "presentation", "investor presentation"),
@@ -314,7 +315,7 @@ func newVerifierAgent(d Deps, facts []string) *agent.Agent {
 	return &agent.Agent{
 		Name:         "research_verifier",
 		Description:  "Answers one specific research question using metrics, filings retrieval and the open web.",
-		SystemPrompt: verifierPrompt,
+		SystemPrompt: prompts.Verifier,
 		Facts:        facts,
 		Model:        d.Model,
 		Tools:        reg,
@@ -328,7 +329,7 @@ func newSynthesizer(d Deps, ask *AskTool, facts []string) *agent.Agent {
 	return &agent.Agent{
 		Name:         "synthesizer",
 		Description:  "Synthesizes specialist findings into the final equity research report.",
-		SystemPrompt: synthesizerPrompt,
+		SystemPrompt: prompts.Synthesizer,
 		Facts:        facts,
 		Model:        d.Model,
 		Tools:        reg,
@@ -337,35 +338,7 @@ func newSynthesizer(d Deps, ask *AskTool, facts []string) *agent.Agent {
 
 }
 
-// --- prompts & persistence helpers --------------------------------------
-
-func specialistTask(role string, co *models.Company) string {
-	base := fmt.Sprintf("Company under review: %s (%s, listed on %s).\n\n", co.Name, co.Symbol, co.Exchange)
-	switch role {
-	case "financial_analyst":
-		return base + "Produce the quantitative findings: run the metrics tools, analyze growth, profitability, returns, solvency, working capital and cash conversion across the available FYs, and flag every data gap you hit."
-	case "annual_report_analyst":
-		return base + "Produce the annual report findings: map the business, pull the reported numbers from the statement tables, and summarize management's commentary, strategy, capex plans and risks as stated in the report."
-	case "presentation_analyst":
-		return base + "Produce the investor presentation findings: identify the period covered, extract the headline claims and their supporting numbers, and separate reported results from forward-looking guidance."
-	}
-	return base
-}
-
-// synthesisInput assembles the labeled specialist findings into the
-// synthesizer's task.
-func synthesisInput(co *models.Company, findings []string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Company: %s (%s, %s)\n\n", co.Name, co.Symbol, co.Exchange)
-	labels := []string{"Financial analysis (metrics)", "Annual report findings", "Investor presentation findings"}
-	for i, f := range findings {
-		if i < len(labels) {
-			fmt.Fprintf(&b, "---\n### %s\n\n%s\n\n", labels[i], strings.TrimSpace(f))
-		}
-	}
-	b.WriteString("---\n\nSynthesize the findings above into the final equity research report. Reconcile contradictions and fill gaps: if something is unclear, incomplete or disputed, call ask_specialist with one specific question before writing that part. When ready, output ONLY the markdown report.")
-	return b.String()
-}
+// --- persistence helpers --------------------------------------------------
 
 // fallbackReport renders the specialist findings as a partial report when
 // the cost budget ran out before synthesis could run. Empty findings are
@@ -375,11 +348,10 @@ func fallbackReport(co *models.Company, findings []string) string {
 	fmt.Fprintf(&b, "# %s (%s) — Equity Research\n\n", co.Name, co.Symbol)
 	b.WriteString("> Partial report: the cost budget ran out before synthesis could run. ")
 	b.WriteString("The specialist findings below are included unedited.\n\n")
-	labels := []string{"Financial analysis (metrics)", "Annual report findings", "Investor presentation findings"}
 	for i, f := range findings {
 		label := "Specialist finding"
-		if i < len(labels) {
-			label = labels[i]
+		if i < len(prompts.FindingLabels) {
+			label = prompts.FindingLabels[i]
 		}
 		fmt.Fprintf(&b, "## %s\n\n", label)
 		if text := strings.TrimSpace(f); text != "" {
